@@ -1,0 +1,7 @@
+updated 22 Jan 2021
+
+run_clean_assemble_bin.sh is the full pipeline for cleaning, assembling, and binning metagenomic reads
+
+to do
+- include gtdbtk taxa assignment
+- include MetaRon operon calling
