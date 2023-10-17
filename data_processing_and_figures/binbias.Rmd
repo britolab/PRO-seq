@@ -1,0 +1,200 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# code to visualize bias across bin features
+
+## read in featurecounts data and merge with gff
+```{r}
+get_fcounts <- function(fcfwd, fcrev, gff) {
+  
+  g <- readr::read_tsv(gff,
+                       col_names = c("contig","drop1","type",
+                                     "start","end","drop2","strand",
+                                     "drop3","attributes")) |>
+    tidyr::separate(col = attributes, sep = ";", into = c("ID","Name")) |>
+    dplyr::mutate(ID = stringr::str_remove(string = ID, pattern = "ID="),
+                  Name = stringr::str_remove(string = Name, pattern = "Name=")) |>
+    dplyr::select(-dplyr::contains("drop")) |>
+    filter(type != "region")
+  
+  readfc <- function(fc) {
+    
+    readr::read_tsv(fc,
+                    comment = "#",
+                    col_names = TRUE) |>
+      dplyr::rename(ID = 1, contig = 2, start = 3, end = 4,
+                    strand = 5, length = 6,
+                    PROseq1 = 9, RNAseq1 = 10, TEXm1 = 11, TEXp1 = 12,
+                    PROseq2 = 13, RNAseq2 = 14, TEXm2 = 15, TEXp2 = 16,
+                    PROseq3 = 17, TEXm3 = 18, TEXp3 = 19) |>
+      dplyr::select(-c(product))
+  }
+  
+  fcf <- readfc(fcfwd) |> tidyr::pivot_longer(cols = c(PROseq1,RNAseq1,TEXm1,TEXp1,
+                                                       PROseq2,RNAseq2,TEXm2,TEXp2,
+                                                       PROseq3, TEXm3,TEXp3),
+                                              names_to = "library",
+                                              values_to = "sense_count")
+  fcr <- readfc(fcrev) |> tidyr::pivot_longer(cols = c(PROseq1,RNAseq1,TEXm1,TEXp1,
+                                                       PROseq2,RNAseq2,TEXm2,TEXp2,
+                                                       PROseq3, TEXm3,TEXp3),
+                                              names_to = "library",
+                                              values_to = "antisense_count")
+  
+  out <- dplyr::full_join(fcf, fcr, suffix = c("", ".y")) |>
+    dplyr::left_join(g, suffix = c("", ".y")) |>
+    dplyr::mutate(sense_count1 = ifelse(test = grepl(pattern = "PROseq", x = library),
+                                        yes = sense_count,
+                                        no = antisense_count),
+                  antisense_count1 = ifelse(test = grepl(pattern = "PROseq", x = library),
+                                            yes = antisense_count,
+                                            no = sense_count)) |>
+    dplyr::select(-c(sense_count, antisense_count)) |>
+    dplyr::rename(sense_count = sense_count1,
+                  antisense_count = antisense_count1)
+
+  cts <- out |> select(library, sense_count, antisense_count) |>
+    mutate(tcount = sense_count + antisense_count) |> 
+    group_by(library) |>
+    summarise(sumcount = sum(tcount))
+  
+  dplyr::full_join(out, cts) |>
+    dplyr::mutate(sense_norm = (sense_count / sumcount) * 10^9) |>
+    dplyr::mutate(antisense_norm = (antisense_count / sumcount) * 10^9) |>
+    select(-c(sense_count, antisense_count, sumcount))
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/featureCounts/")
+US2_fcounts <- get_fcounts("US2/US2_q30_fcounts_fwd.txt",
+                           "US2/US2_q30_fcounts_rev.txt",
+                           "US2/US2_bins.gff3")
+US3_fcounts <- get_fcounts("US3/US3_q30_fcounts_fwd.txt",
+                           "US3/US3_q30_fcounts_rev.txt",
+                           "US3/US3_bins.gff3")
+```
+
+## plot correlations within and between library type replicates
+```{r}
+plot_corr <- function(data, ftype) {
+  
+  require(GGally)
+  data |>
+    filter(type == ftype) |>
+    select(ID, library, sense_norm) |>
+    mutate(log_norm = log10(sense_norm + 1)) |>
+    select(-sense_norm) |>
+    pivot_wider(names_from = library, values_from = log_norm) |>
+    select(PROseq1, PROseq2, PROseq3,
+           TEXp1, TEXp2, TEXp3,
+           TEXm1, TEXm2, TEXm3,
+           RNAseq1, RNAseq2) |>
+    ggpairs(axisLabels = "none",
+            title = ftype) +
+    theme_bw()
+    
+  
+} 
+
+US2_corr_CDS <- plot_corr(US2_fcounts, "CDS")
+US2_corr_ncRNA <- plot_corr(US2_fcounts, "ncRNA")
+US2_corr_tRNA <- plot_corr(US2_fcounts, "tRNA")
+US3_corr_CDS <- plot_corr(US3_fcounts, "CDS")
+US3_corr_ncRNA <- plot_corr(US3_fcounts, "ncRNA")
+US3_corr_tRNA <- plot_corr(US3_fcounts, "tRNA")
+```
+
+### ggsave
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/bias/")
+ggsave(filename = "US2_corr_CDS_mergereps_logplus1_v2.pdf", US2_corr_CDS, width = 8, height = 8)
+ggsave(filename = "US2_corr_ncRNA_mergereps_logplus1_v2.pdf", US2_corr_ncRNA, width = 8, height = 8)
+ggsave(filename = "US2_corr_tRNA_mergereps_logplus1_v2.pdf", US2_corr_tRNA, width = 8, height = 8)
+ggsave(filename = "US3_corr_CDS_mergereps_logplus1_v2.pdf", US3_corr_CDS, width = 8, height = 8)
+ggsave(filename = "US3_corr_ncRNA_mergereps_logplus1_v2.pdf", US3_corr_ncRNA, width = 8, height = 8)
+ggsave(filename = "US3_corr_tRNA_mergereps_logplus1_v2.pdf", US3_corr_tRNA, width = 8, height = 8)
+```
+
+## plot correlations between library types (merged replicates)
+```{r}
+plot_corr2 <- function(data, ftype) {
+  
+  require(GGally)
+  data |>
+    filter(type == ftype) |>
+    mutate(library = stringr::str_sub(library, 1, -2)) |>
+    group_by(ID, library) |>
+    summarise(merge_sense_norm = sum(sense_norm)) |>
+    ungroup() |>
+    mutate(log_norm = log10(merge_sense_norm + 1)) |>
+    select(-merge_sense_norm) |>
+    pivot_wider(names_from = library, values_from = log_norm) |>
+    select(PROseq,TEXp,TEXm,RNAseq) |>
+    ggpairs(axisLabels = "none",
+            title = ftype) +
+    theme_bw()
+    
+  
+} 
+
+US2_corr_CDS <- plot_corr2(US2_fcounts, "CDS")
+US2_corr_ncRNA <- plot_corr2(US2_fcounts, "ncRNA")
+US2_corr_tRNA <- plot_corr2(US2_fcounts, "tRNA")
+US3_corr_CDS <- plot_corr2(US3_fcounts, "CDS")
+US3_corr_ncRNA <- plot_corr2(US3_fcounts, "ncRNA")
+US3_corr_tRNA <- plot_corr2(US3_fcounts, "tRNA")
+```
+
+## read in binstats data
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE)
+
+merged_bins <- bind_rows(
+  US2_bins |> mutate(sample = "US2"),
+  US3_bins |> mutate(sample = "US3")
+)
+```
+
+## read in scaffold2bin mapping
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly")
+get_map <- function(data) {
+  read_tsv(file = data,
+           col_names = c("contig","bin"))
+}
+
+US2_scaff2bins <- get_map("US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt")
+US3_scaff2bins <- get_map("US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt")
+```
+
+## merge counts, bins, and mapping data
+```{r}
+merge_all <- function(counts, bins, scaff2bins) {
+  left_join(counts, scaff2bins, by = "contig") |>
+    left_join(bins, by = "bin") |>
+    select(bin,ID,strand,length,Name,library,type,
+           sense_norm,antisense_norm,completeness,
+           contamination,phylum,species,percent_community)
+}
+
+US2_merged <- merge_all(US2_fcounts, US2_bins, US2_scaff2bins)
+US3_merged <- merge_all(US3_fcounts, US3_bins, US3_scaff2bins)
+```
+
+## plot counts distribution by library and bin
+```{r}
+plot_bias <- function(data, complete, contam) {
+  filter(data,
+         completeness >= complete,
+         contamination <= contam) |>
+    ggplot() +
+    geom_boxplot(mapping = aes(x = bin, y = log10(sense_norm), color = library),
+                 position = "dodge")
+}
+
+plot_bias(US2_merged, 90, 5)
+```

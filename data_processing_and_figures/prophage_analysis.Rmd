@@ -1,0 +1,546 @@
+---
+title: "prophage analysis"
+output: html_notebook
+---
+
+## read in prophage data
+```{r}
+read_prophage <- function(vibrant) {
+  
+  require(tidyverse)
+  
+  prophage <- readr::read_tsv(file = vibrant, col_names = TRUE) |>
+    dplyr::rename(contig = scaffold)
+  names(prophage) <- gsub(" ", "_", names(prophage))
+  prophage
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation")
+US2_prophage <- read_prophage("US2_vibrant/VIBRANT_contigs/VIBRANT_results_contigs/VIBRANT_integrated_prophage_coordinates_contigs.tsv")
+US3_prophage <- read_prophage("US3_vibrant/VIBRANT_contigs/VIBRANT_results_contigs/VIBRANT_integrated_prophage_coordinates_contigs.tsv")
+```
+
+## read in coverage data and subset for prophage contigs
+```{r}
+subset_cov <- function(name, file, pdat, context, qscore) {
+  
+  setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+  
+  subby <- pdat |>
+    dplyr::select(contig, nucleotide_start, nucleotide_stop) |>
+    dplyr::group_by(contig) |>
+    dplyr::summarize(start = min(nucleotide_start), end = max(nucleotide_stop)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(length = as.double(stringr::str_match(string = contig,
+                                                        pattern = "length_\\s*(.*?)\\s*_cov")[,2])) |>
+    dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+                                                        pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    dplyr::mutate(start = ifelse(start <= context,
+                                 yes = 1,
+                                 no = start - context),
+                  end = ifelse(end + context > length,
+                               yes = end,
+                               no = end + context))
+  
+  big <- readr::read_tsv(file = file,
+                  col_names = TRUE)
+  
+  # Normalization factors (per million mapped nt)
+  PROnorm <- (sum(dplyr::select(big, PRO_plus_full)) + sum(dplyr::select(big, PRO_minus_full))) / 10^9
+  RNAnorm <- (sum(dplyr::select(big, RNA_plus)) + sum(dplyr::select(big, RNA_minus))) / 10^9
+  TEXpnorm <- (sum(dplyr::select(big, TEXp_plus)) + sum(dplyr::select(big, TEXp_minus))) / 10^9
+  TEXmnorm <- (sum(dplyr::select(big, TEXm_plus)) + sum(dplyr::select(big, TEXm_minus))) / 10^9
+  
+  ### Approach 1: SLOW
+  # apply(X = subby, MARGIN = 1, function(x) {
+  #   big |> dplyr::filter(contig == x[1],
+  #                        position %in% x[4]:x[5])
+  #   }
+  # ) |> dplyr::bind_rows()
+  
+  ### Approach 2 : FASTER
+  subby |> tidyr::pivot_longer(cols = c(start, end),
+                               values_to = "position") |>
+    dplyr::select(contig, position) |>
+    dplyr::group_by(contig) |>
+    tidyr::complete(position = seq(from = min(position),
+                                   to = max(position))) |>
+    dplyr::left_join(big) |> ungroup() |>
+    dplyr::mutate(PRO_plus_full = PRO_plus_full / PROnorm,
+                  PRO_minus_full = PRO_minus_full / PROnorm,
+                  PRO_plus_3 = PRO_plus_3 / PROnorm,
+                  PRO_minus_3 = PRO_minus_3 / PROnorm,
+                  PRO_plus_5 = PRO_plus_5 / PROnorm,
+                  PRO_minus_5 = PRO_minus_5 / PROnorm,
+                  RNA_plus = RNA_plus / RNAnorm,
+                  RNA_minus = RNA_minus / RNAnorm,
+                  TEXp_plus = TEXp_plus / TEXpnorm,
+                  TEXp_minus = TEXp_minus / TEXpnorm,
+                  TEXm_plus = TEXm_plus / TEXmnorm,
+                  TEXm_minus = TEXm_minus / TEXmnorm) 
+  
+  ### https://stackoverflow.com/q/74437717/7976890
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+US2_cov <- subset_cov("US2", "US2_combined_q30_correct.txt", US2_curated, 100, 30)
+US3_cov <- subset_cov("US3", "US3_combined_q30_correct.txt", US3_curated, 100, 30)
+```
+
+## read in bin data
+```{r}
+# read the BINSTATS file made with the clean_assemble_bin.sh pipeline
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+```
+
+## read in scaffold2bin mapping
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_scaff2bin <- read_tsv("US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt", col_names = c("contig", "bin"), show_col_types = FALSE)
+US3_scaff2bin <- read_tsv("US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt", col_names = c("contig", "bin"), show_col_types = FALSE)
+```
+
+## read in bakta annotations and subset for prophage contigs
+```{r}
+read_gff3 <- function(gff3, pdat) {
+  
+  require(tidyverse)
+  cnames <- c("contig","source","feature","start","end","score","strand","frame","attribute")
+  
+  readr::read_tsv(file = gff3, comment = "#", col_names = cnames) |>
+    dplyr::filter(contig %in% unique(pdat$contig)) |> 
+    dplyr::filter(feature == "CDS") |>
+    dplyr::mutate(product = stringr::str_match(attribute, "Name=\\s*(.*?)\\s*;locus_tag")[,2]) |>
+    dplyr::select(contig, start, end, strand, product)
+    
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation/")
+US2_genes <- read_gff3("US2_bins_bakta/US2_bins_merged.gff3", US2_curated)
+US3_genes <- read_gff3("US3_bins_bakta/US3_bins_merged.gff3", US3_curated)
+```
+
+## plot coverage across prophages
+```{r}
+plot_phage <- function(lab, covdat, pdat, bindat, scaff2bin, genedat, context, writeout) {
+  
+  # lab = sample label used for output filename string
+  # covdat = coverage data, made in chunk above
+  # pdat = prophage data, made in chunk above
+  # bindat = bin data
+  # scaff2bin = scaffold-to-bin mapping file
+  # genedat = genes on prophage contigs
+  # context = nt around tRNA(s) to plot (can't be greater than context used for covdat object)
+  # qscore = qscore used to filter mapping values used to create coverage file
+  
+  require(tidyverse)
+  require(stringr)
+  require(patchwork)
+  require(staplr)
+
+  # get unique phage from Vibrant output
+  phage_list <- pdat |> 
+    dplyr::select(fragment) |>
+    purrr::as_vector() |> unique()
+  
+  length(phage_list)
+  
+  # iterate through contig list
+  sapply(phage_list, function(xp) {
+    
+    # get shortened contig name as it appears in covdat
+    con_short <- stringr::str_match(string = xp, 
+                                    pattern = "NODE_\\s*(.*?)\\s*_length")[2]
+    # get length of full contig
+    clen <- as.numeric(stringr::str_match(string = xp,
+                                          pattern = "length_\\s*(.*?)\\s*_cov")[2])
+    # get vector representing data for phage
+    pvec <- dplyr::filter(pdat, fragment == xp)
+    # get full contig name for indexing 
+    con <- as.character(pvec$contig)
+    # get length of prophage
+    plen <- as.numeric(pvec$nucleotide_length)
+    # get bin if contig is binned
+    pbin <- dplyr::filter(scaff2bin, contig == con) |>
+      dplyr::select(bin) |> as.character()
+    if (is.na(pbin)) {
+      pbin <- "unbinned"
+      spec <- "n/a"
+    } else {
+      spec <- bindat |> dplyr::filter(bin == pbin) |>
+        dplyr::select(species) |> as.character()
+      if (is.na(spec)) {
+        spec <- "[no species]"}
+    }
+        
+    message(paste0("sample: ", lab,
+                   ", phage: ", xp))
+    
+    xmin <- as.numeric(pvec$nucleotide_start) - context
+    xmax <- as.numeric(pvec$nucleotide_stop) + context
+    
+    if (xmin < 1) {
+      xmin <- 1
+    }
+    if (xmax > clen) {
+      xmax <- clen
+    }
+    
+    cov <- covdat |> dplyr::filter(contig == con_short) |>
+      dplyr::filter(position %in% xmin:xmax) |>
+      tidyr::pivot_longer(cols = -c(contig,position),
+                          names_to = "lib",
+                          values_to = "value") |>
+      dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib), # flipped!!!
+                                   yes = -1 * as.numeric(value),
+                                   no = as.numeric(value))) |>
+      dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                    yes = "minus",
+                                    no = "plus")) |>
+      dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!!!
+                                            grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!!!
+                                            grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                            grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                            grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                            grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+"))
+        
+    ymax <- max(abs(dplyr::select(cov, value)))
+    
+    pgenes <- dplyr::filter(genedat, 
+                            contig == con,
+                            start >= xmin,
+                            end <= xmax) |>
+      dplyr::mutate(orientation = ifelse(strand == "+",1,-1)) |> 
+      dplyr::mutate(middle = (start + end)/2)
+          
+    breaks <- seq(from = xmin,
+                  to = xmax,
+                  by = round((xmax - xmin)/6, digits = 0))
+               
+    trace <- ggplot(data = cov) +
+      geom_area(mapping = aes(x = position, y = value, linetype = strand),
+                color = "#ff0000",
+                fill = "#ff0000") +
+      facet_grid(factor(type) ~ .) +
+      geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                              y = ymax * 0.8,
+                              label = type),
+                hjust = 0,
+                size = 3.5,
+                check_overlap = TRUE) +
+      scale_x_continuous(breaks = breaks,
+                         labels = sprintf("%.2f", (breaks / 1000))) +
+      coord_cartesian(xlim = c(xmin, xmax),
+                      ylim = c(-ymax - (0.05 * ymax), ymax + (0.05 * ymax))) +
+      scale_linetype_manual(values = c(1,1)) +
+      theme_bw() +
+      ggtitle(paste0(lab, ": ", spec, " (", xp,")")) +
+      geom_hline(yintercept = 0, color = "black") +
+      ylab("Depth per base per billion mapped nt") +
+      xlab("Position on contig (kbp)") +
+      theme(axis.title.x = element_text(size = 10),
+            axis.title.y = element_text(size = 10),
+            axis.text = element_text(color = "black", size = 10),
+            title = element_text(size = 8),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            strip.background = element_blank(),
+            strip.text = element_blank(),
+            legend.position = "none")
+          
+    genes <- ggplot(data = pgenes,
+                    mapping = aes(xmin = start,
+                                  xmax = end,
+                                  y = contig,
+                                  x = middle,
+                                  fill = product, 
+                                  label = product,
+                                  forward = orientation)) +
+      gggenes::geom_gene_arrow() +
+      scale_fill_brewer(palette = "Set3") +
+      geom_text(angle = -90, hjust = -0.5, vjust = 0.3, size = 2) +
+      scale_x_continuous(breaks = breaks,
+                         labels = sprintf("%.1f", (breaks / 1000)),
+                         limits = c(xmin,xmax)) +
+      gggenes::theme_genes() +
+      xlab("position (kbp)") +
+      theme(axis.text.y = element_blank(),
+            axis.title.y = element_blank(),
+            legend.position = "none",
+            axis.text.x = element_text(color = "black", size = 10))
+  
+    tg <- trace / genes + plot_layout(heights = c(2, 1))
+    
+    
+    # save each plot as a pdf
+    fname <- paste(lab, paste0("prophage_",xp), "partial.pdf", sep = "_")
+    ggsave(filename = fname,
+           plot = tg,
+           device = cairo_pdf,
+           dpi = 600,
+           width = 6,
+           height = 8)
+    
+  }) # sapply statement
+  
+  # create ordered pdf list by number of RNA-seq reads
+  glob <- glob2rx(paste0(lab,"*_partial.pdf"))
+  pdflist <- list.files(path = ".", pattern = glob)
+  # combine pdfs into a single file
+  staplr::staple_pdf(input_files = pdflist,
+                     output_filepath = file.path(".", writeout))
+  # remove individual pdfs
+  do.call(file.remove, list(pdflist))
+  
+}
+```
+
+### test plotting function on subset of contigs
+```{r}
+# testing
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/prophage")
+plot_phage(lab = "US3",
+           covdat = US3_cov,
+           pdat = dplyr::filter(US3_prophage,
+                                fragment %in% c("NODE_141_length_119313_cov_10.976027_fragment_1",
+                                                "NODE_978_length_28260_cov_8.605176_fragment_1")),
+           bindat = US3_bins,
+           scaff2bin = US3_scaff2bin,
+           genedat = US3_genes,
+           context = 100,
+           qscore = 30)
+```
+
+### run plotting function on all bins
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/prophage")
+plot_phage(lab = "US3",
+           covdat = US3_cov,
+           pdat = US3_prophage,
+           bindat = US3_bins,
+           scaff2bin = US3_scaff2bin,
+           genedat = US3_genes,
+           context = 100,
+           writeout = "US3_merged_prophage_q30_v1.pdf")
+```
+
+
+
+
+
+## manually curated phage ranges
+```{r}
+require(tidyverse)
+toquo <- function(string) { dput(scan(text = string, what = "")) }
+
+US2_curated <- tibble(fragment = toquo("NODE_106_length_118907_cov_10.036196_fragment_1
+                                       NODE_15_length_241020_cov_10.688656_fragment_4
+                                       NODE_171_length_92143_cov_48.161215_fragment_1
+                                       NODE_180_length_90135_cov_10.842229_fragment_1
+                                       NODE_19_length_220630_cov_28.159025_fragment_1
+                                       NODE_313_length_64392_cov_230.546062_fragment_1
+                                       NODE_313_length_64392_cov_230.546062_fragment_1
+                                       NODE_489_length_47487_cov_10.937658_fragment_1
+                                       NODE_489_length_47487_cov_10.937658_fragment_1
+                                       NODE_489_length_47487_cov_10.937658_fragment_1
+                                       NODE_489_length_47487_cov_10.937658_fragment_1
+                                       NODE_494_length_47218_cov_9.931005_fragment_2"),
+                      nucleotide_start = c(50000,94000,45000,26000,36000,15000,37000,0,18000,9000,25000,43000),
+                      nucleotide_stop = c(60000,104000,50000,31000,50000,17000,40000,2000,20000,11000,27000,46000)) |>
+  left_join(US2_prophage |> select(-c(nucleotide_start,nucleotide_stop)), by = "fragment")
+
+US3_curated <- tibble(fragment = toquo("NODE_1049_length_26355_cov_7.595894_fragment_1
+                                       NODE_105_length_136175_cov_31.948531_fragment_1
+                                       NODE_105_length_136175_cov_31.948531_fragment_1
+                                       NODE_150_length_110503_cov_173.256890_fragment_1
+                                       NODE_150_length_110503_cov_173.256890_fragment_1
+                                       NODE_150_length_110503_cov_173.256890_fragment_1
+                                       NODE_466_length_55374_cov_47.999150_fragment_1
+                                       NODE_67_length_161504_cov_30.935943_fragment_1
+                                       NODE_8_length_337194_cov_28.281320_fragment_4"),
+                      nucleotide_start = c(14000,106000,126000,1000,22000,36000,36000,126000,247000),
+                      nucleotide_stop = c(16000,114000,136000,7000,29000,39000,38000,131000,252000)) |>
+  left_join(US3_prophage |> select(-c(nucleotide_start,nucleotide_stop)), by = "fragment")
+```
+
+## plot coverage across prophages
+```{r}
+plot_phage_curated <- function(lab, covdat, pdat, bindat, scaff2bin, genedat, context, writeout) {
+  
+  # lab = sample label used for output filename string
+  # covdat = coverage data, made in chunk above
+  # pdat = prophage data, made in chunk above
+  # bindat = bin data
+  # scaff2bin = scaffold-to-bin mapping file
+  # genedat = genes on prophage contigs
+  # context = nt around tRNA(s) to plot (can't be greater than context used for covdat object)
+  # qscore = qscore used to filter mapping values used to create coverage file
+  
+  require(tidyverse)
+  require(stringr)
+  require(patchwork)
+  require(staplr)
+  
+  # iterate through contig list
+  apply(pdat, MARGIN = 1, function(line) {
+    
+    xp <- line[[1]]
+    xL <- line[[2]]
+    xR <- line[[3]]
+    con <- line[[4]]
+    plen <- line[[8]]
+    
+    # get shortened contig name as it appears in covdat
+    con_short <- stringr::str_match(string = con, 
+                                    pattern = "NODE_\\s*(.*?)\\s*_length")[2]
+    # get length of full contig
+    clen <- as.numeric(stringr::str_match(string = con,
+                                          pattern = "length_\\s*(.*?)\\s*_cov")[2])
+    # get full contig name for indexing 
+    # get bin if contig is binned
+    pbin <- dplyr::filter(scaff2bin, contig == con) |>
+      dplyr::select(bin) |> as.character()
+    if (is.na(pbin)) {
+      pbin <- "unbinned"
+      spec <- "n/a"
+    } else {
+      spec <- bindat |> dplyr::filter(bin == pbin) |>
+        dplyr::select(species) |> as.character()
+      if (is.na(spec)) {
+        spec <- "[no species]"}
+    }
+        
+    message(paste0("sample: ", lab,
+                   ", phage: ", xp))
+    
+    xmin <- as.numeric(xL) - context
+    xmax <- as.numeric(xR) + context
+    
+    if (xmin < 1) {
+      xmin <- 1
+    }
+    if (xmax > clen) {
+      xmax <- clen
+    }
+    
+    cov <- covdat |> dplyr::filter(contig == con_short) |>
+      dplyr::filter(position %in% xmin:xmax) |>
+      tidyr::pivot_longer(cols = -c(contig,position),
+                          names_to = "lib",
+                          values_to = "value") |>
+      dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib), # flipped!!!
+                                   yes = -1 * as.numeric(value),
+                                   no = as.numeric(value))) |>
+      dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                    yes = "minus",
+                                    no = "plus")) |>
+      dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!!!
+                                            grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!!!
+                                            grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                            grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                            grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                            grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+"))
+        
+    ymax <- max(abs(dplyr::select(cov, value)))
+    
+    pgenes <- dplyr::filter(genedat, 
+                            contig == con,
+                            start >= xmin,
+                            end <= xmax) |>
+      dplyr::mutate(orientation = ifelse(strand == "+",1,-1)) |> 
+      dplyr::mutate(middle = (start + end)/2) |>
+      dplyr::mutate(product = ifelse(product == "hypothetical protein", "", product))
+          
+    breaks <- seq(from = xmin,
+                  to = xmax,
+                  by = round((xmax - xmin)/6, digits = 0))
+               
+    trace <- ggplot(data = cov) +
+      geom_area(mapping = aes(x = position, y = value, linetype = strand),
+                color = "#ff0000",
+                fill = "#ff0000") +
+      facet_grid(factor(type) ~ .) +
+      geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                              y = ymax * 0.8,
+                              label = type),
+                hjust = 0,
+                size = 3.5,
+                check_overlap = TRUE) +
+      scale_x_continuous(breaks = breaks,
+                         labels = sprintf("%.2f", (breaks / 1000))) +
+      coord_cartesian(xlim = c(xmin, xmax),
+                      ylim = c(-ymax - (0.05 * ymax), ymax + (0.05 * ymax))) +
+      scale_linetype_manual(values = c(1,1)) +
+      theme_bw() +
+      ggtitle(paste0(lab, ": ", spec, " (", xp,")")) +
+      geom_hline(yintercept = 0, color = "black") +
+      ylab("Depth per base per billion mapped nt") +
+      xlab("Position on contig (kbp)") +
+      theme(axis.title.x = element_text(size = 10),
+            axis.title.y = element_text(size = 10),
+            axis.text = element_text(color = "black", size = 10),
+            title = element_text(size = 8),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            strip.background = element_blank(),
+            strip.text = element_blank(),
+            legend.position = "none")
+          
+    genes <- ggplot(data = pgenes,
+                    mapping = aes(xmin = start,
+                                  xmax = end,
+                                  y = contig,
+                                  x = middle,
+                                  fill = product, 
+                                  label = stringr::str_wrap(product, 20),
+                                  forward = orientation)) +
+      gggenes::geom_gene_arrow() +
+      #gggenes::geom_gene_label(reflow = TRUE) +
+      scale_fill_brewer(palette = "Set3") +
+      #geom_text(angle = -90, hjust = -0.5, vjust = 0.3, size = 2) +
+      geom_text(angle = 0, size = 3) +
+      scale_x_continuous(breaks = breaks,
+                         labels = sprintf("%.1f", (breaks / 1000)),
+                         limits = c(xmin,xmax)) +
+      gggenes::theme_genes() +
+      xlab("position (kbp)") +
+      theme(axis.text.y = element_blank(),
+            axis.title.y = element_blank(),
+            legend.position = "none",
+            axis.text.x = element_text(color = "black", size = 10))
+  
+    tg <- trace / genes + plot_layout(heights = c(3, 1))
+    
+    
+    # save each plot as a pdf
+    fname <- paste(lab, paste0("prophage_",xp), "partial.pdf", sep = "_")
+    ggsave(filename = fname,
+           plot = tg,
+           device = cairo_pdf,
+           dpi = 600,
+           width = 8,
+           height = 6)
+    
+  }) # sapply statement
+  
+  # create ordered pdf list by number of RNA-seq reads
+  glob <- glob2rx(paste0(lab,"*_partial.pdf"))
+  pdflist <- list.files(path = ".", pattern = glob)
+  # combine pdfs into a single file
+  staplr::staple_pdf(input_files = pdflist,
+                     output_filepath = file.path(".", writeout))
+  # remove individual pdfs
+  do.call(file.remove, list(pdflist))
+  
+}
+```
+
+
+
+
+
+

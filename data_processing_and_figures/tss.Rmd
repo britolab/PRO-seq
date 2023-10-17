@@ -1,0 +1,354 @@
+---
+title: "TSS analysis"
+output: html_notebook
+---
+
+# visualization of loci called by TSSAR as transcription start sites
+
+## read in TSSAR bed files
+```{r}
+# library(tidyverse)
+
+read_tss <- function(tssdat, scaff2bin) {
+  read_tsv(file = tssdat,
+           col_names = c("contig","start","end","id","score","strand")) |>
+    left_join(read_tsv(file = scaff2bin,
+                       col_names = c("contig","bin")),
+              by = "contig")
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3")
+US2_tss <- read_tss("transcriptomes/tssar/US2_TEX/US2_TSS_100000nt_1000reads.bed",
+                    "assembly/US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt")
+US3_tss <- read_tss("transcriptomes/tssar/US3_TEX/US3_TSS_100000nt_1000reads.bed",
+                    "assembly/US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt")
+```
+
+## read in coverage and subset for TSS contigs and range
+```{r}
+subset_cov <- function(name, tssdat, context, qscore) {
+  
+  setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+  
+  subby <- tssdat |>
+    dplyr::select(contig, start, end) |>
+    dplyr::group_by(contig) |>
+    dplyr::summarize(start = min(start), end = max(end)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(length = as.double(stringr::str_match(string = contig,                                                                                                                                                                        pattern = "length_\\s*(.*?)\\s*_cov")[,2])) |>
+    dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+                                                        pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    dplyr::mutate(start = ifelse(start <= context,
+                                 yes = 1,
+                                 no = start - context),
+                  end = ifelse(end + context > length,
+                               yes = end,
+                               no = end + context))
+  
+  big <- readr::read_tsv(file = paste0(name,"_combined_q", qscore, ".txt"),
+                  col_names = TRUE)
+  
+  # Normalization factors (per million mapped nt)
+  PROnorm <- (sum(dplyr::select(big, PRO_plus_full)) + sum(dplyr::select(big, PRO_minus_full))) / 10^9
+  RNAnorm <- (sum(dplyr::select(big, RNA_plus)) + sum(dplyr::select(big, RNA_minus))) / 10^9
+  TEXpnorm <- (sum(dplyr::select(big, TEXp_plus)) + sum(dplyr::select(big, TEXp_minus))) / 10^9
+  TEXmnorm <- (sum(dplyr::select(big, TEXm_plus)) + sum(dplyr::select(big, TEXm_minus))) / 10^9
+  
+  ### Approach 1: SLOW
+  # apply(X = subby, MARGIN = 1, function(x) {
+  #   big |> dplyr::filter(contig == x[1],
+  #                        position %in% x[4]:x[5])
+  #   }
+  # ) |> dplyr::bind_rows()
+  
+  ### Approach 2 : FASTER
+  subby |> tidyr::pivot_longer(cols = c(start, end),
+                               values_to = "position") |>
+    dplyr::select(contig, position) |>
+    dplyr::group_by(contig) |>
+    tidyr::complete(position = seq(from = min(position),
+                                   to = max(position))) |>
+    dplyr::left_join(big) |> ungroup() |>
+    dplyr::mutate(PRO_plus_full = PRO_plus_full / PROnorm,
+                  PRO_minus_full = PRO_minus_full / PROnorm,
+                  PRO_plus_3 = PRO_plus_3 / PROnorm,
+                  PRO_minus_3 = PRO_minus_3 / PROnorm,
+                  PRO_plus_5 = PRO_plus_5 / PROnorm,
+                  PRO_minus_5 = PRO_minus_5 / PROnorm,
+                  RNA_plus = RNA_plus / RNAnorm,
+                  RNA_minus = RNA_minus / RNAnorm,
+                  TEXp_plus = TEXp_plus / TEXpnorm,
+                  TEXp_minus = TEXp_minus / TEXpnorm,
+                  TEXm_plus = TEXm_plus / TEXmnorm,
+                  TEXm_minus = TEXm_minus / TEXmnorm)
+  
+  ### https://stackoverflow.com/q/74437717/7976890
+  
+}
+
+US2_cov <- subset_cov("US2", US2_tss, 100, 30)
+US3_cov <- subset_cov("US3", US3_tss, 100, 30)
+```
+
+## read in bin data
+```{r}
+# read the BINSTATS file made with the clean_assemble_bin.sh pipeline
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE)
+```
+
+## read in bakta annotations and subset for TSS contigs
+```{r}
+read_gff3 <- function(file, tssdat) {
+  
+  require(tidyverse)
+  cnames <- c("seqname","source","feature","start","end","score","strand","frame","attribute")
+  
+  # read in raw gtf as tsv and remove comment rows
+  messy <- readr::read_tsv(file, col_names = cnames, comment = "#") |>
+    dplyr::filter(seqname %in% unique(tssdat$contig))
+  
+  # get the unique attribute types
+  # this assumes there are no spaces in the attribute names
+  att_names <- messy |> dplyr::select(attribute) |>
+    apply(MARGIN = 1, FUN = stringr::str_split, pattern = ';') |>
+    unlist() |> trimws() |>
+    sub(pattern = "=.*$", replacement = "") |> unique()
+  
+  att_names <- stats::na.omit(att_names[att_names != ""])
+    
+  # for each attribute type, create column
+  # apply over gtf to fill in rows where attribute type is found
+  for (att in att_names) {
+    
+    colatt <- apply(messy, MARGIN = 1, function(x) {
+
+      vlist <- x[9] |> strsplit(split = ";") |> unlist()
+      c(stringr::str_remove(pattern = paste0(att,"="),
+                            string = vlist[which(grepl(pattern = paste0(att,"="),
+                                                       x = vlist))]),
+                            NA)[1]
+      
+    })
+    
+    messy <- messy |> tibble::add_column("{att}" := colatt)
+    
+  }
+  
+  # remove original attribute column
+  messy |> dplyr::select(-c(attribute))
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation")
+US2_gff3 <- read_gff3(file = "US2_bins_bakta/US2_allbins.gff3", tssdat = US2_tss)
+US3_gff3 <- read_gff3(file = "US3_bins_bakta/US3_allbins.gff3", tssdat = US3_tss)
+```
+
+## plot coverage proximal to TSS
+```{r}
+plot_tss <- function(lab, covdat, tdat, bindat, gap, context, qscore) {
+  
+  # lab = sample label used for output filename string
+  # covdat = coverage data, made in chunk above
+  # tdat = tss data, made in chunk above
+  # bindat = bin data
+  # gap = maximum allowable nt between consecutive tss to be grouped together in one plot
+  # context = nt around tss to plot (can't be greater than context used for covdat object)
+  # qscore = qscore used to filter mapping values used to create coverage file
+  
+  require(tidyverse)
+  require(stringr)
+  require(staplr)
+
+  # get unique contigs
+  
+  contig_list <- tdat |> 
+    dplyr::select(contig) |>
+    purrr::as_vector() |> unique()
+  
+  # iterate through contig list
+  sapply(contig_list, function(xcon) {
+    
+    # get shortened contig name as it appears in covdat
+    con <- stringr::str_match(string = xcon,
+                              pattern = "NODE_\\s*(.*?)\\s*_length")[2]
+    len <- as.numeric(stringr::str_match(string = xcon,
+                                         pattern = "length_\\s*(.*?)\\s*_cov")[2])
+    tbin <- tdat |> dplyr::filter(contig == xcon) |>
+      dplyr::select(bin) |> dplyr::slice(1) |> as.character()
+    spec <- bindat |> dplyr::filter(bin == tbin) |>
+      dplyr::select(species) |> as.character()
+    
+    if (is.na(spec)) {
+      spec <- "[no species]"
+    }
+    
+    # group tss by proximity (closer than "gap")
+    arr <- tdat |> dplyr::filter(contig == xcon) |>
+      dplyr::arrange(start) |>
+      dplyr::mutate(diff = tidyr::replace_na(start - dplyr::lag(end), 0)) |>
+      dplyr::mutate(brk = ifelse(diff >= gap, 1, 0)) |>
+      dplyr::mutate(grp = cumsum(brk) + 1) |>
+      dplyr::select(contig, id, start, end, strand, grp)
+
+    array_list <- arr |> dplyr::select(grp) |>
+      purrr::as_vector() |> unique()
+    
+    # iterate through per-contig tss list
+    sapply(array_list, function(xarr) {
+      
+      arrsub <- arr |> dplyr::filter(grp == xarr) |>
+        dplyr::mutate(tlen = end - start)
+      tcount <- nrow(arrsub)
+      scount <- dplyr::select(arrsub, strand) |> unique() |> nrow()
+      
+      # only process tss where all on the same strand
+      if (tcount >= 1 && scount == 1) {
+      
+        xmin <- arrsub |> dplyr::select(start) |> min() - context
+        if (xmin < 1) {
+          xmin <- 1
+        }
+        
+        xmax <- arrsub |> dplyr::select(end) |> max() + context
+        if (xmax > len) {
+          xmax <- len
+        }
+        
+        cov <- covdat |> dplyr::filter(contig == con) |>
+          dplyr::filter(position %in% xmin:xmax) |>
+          tidyr::pivot_longer(cols = -c(contig,position),
+                              names_to = "lib",
+                              values_to = "value") |>
+          dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib), # flipped!!!
+                                       yes = -1 * as.numeric(value),
+                                       no = as.numeric(value))) |>
+          dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                        yes = "minus",
+                                        no = "plus")) |>
+          dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!!!
+                                                grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!!!
+                                                grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                                grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                                grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                                grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+"))
+             
+        str <- arrsub |> dplyr::select(strand) |> purrr::as_vector() |> unique()
+        
+        message(paste0("sample: ", lab,
+                       ", contig: ", xcon,
+                       ", array group: ", xarr,
+                       ", tss count: ", tcount))
+        
+        ymax <- cov |> select(value) |> abs() |> max()
+        
+        # only process arrays with min coverage
+        if (length(str) == 1 && str == "+") {
+            textpos <- -1
+            # arrows <- data.frame(x = arrsub$start + (arrsub$tlen / 10),
+            #                      xend = arrsub$end - (arrsub$tlen / 10),
+            #                      y = -ymax * 0.28)
+        } else if (length(str) == 1 && str == "-") {
+          textpos <- 1
+          # arrows <- data.frame(x = arrsub$end - (arrsub$tlen / 10),
+          #                        xend = arrsub$start + (arrsub$tlen / 10),
+          #                        y = ymax * 0.28)
+        }
+          
+        breaks <- seq(from = xmin,
+                      to = xmax,
+                      by = round((xmax - xmin)/6, digits = 0))
+               
+        # boxes <- data.frame(x1 = arrsub$start,
+        #                     x2 = arrsub$end,
+        #                     y1 = -ymax * 0.2,
+        #                     y2 = ymax * 0.2,
+        #                     stringsAsFactors = F,
+        #                     text = arrsub$tRNA)
+               
+        pc <- ggplot(data = cov) +
+          geom_area(mapping = aes(x = position, y = value, linetype = strand),
+                    color = "#ff0000",
+                    fill = "#ff0000") +
+                    facet_grid(factor(type) ~ .) +
+          geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                                  y = ymax * 0.8,
+                                  label = type),
+                    hjust = 0,
+                    size = 3.5,
+                    check_overlap = TRUE) +
+          # geom_rect(data = boxes,
+          #           mapping = aes(xmin = x1, xmax = x2, ymin = y1, ymax = y2),
+          #           fill = "black",
+          #           alpha = 0.2,
+          #           inherit.aes = FALSE) +
+          # geom_text(data = boxes,
+          #           mapping = aes(x = x1 + ((x2 - x1) / 2),
+          #                         label = text),
+          #           y = 0.45 * ymax * textpos,
+          #           inherit.aes = FALSE) +
+          # geom_segment(data = arrows,
+          #              mapping = aes(x = x, xend = xend, y = y, yend = y),
+          #              lineend = "butt", linejoin = "round",
+          #              linewidth = 0.5, arrow = arrow(length = unit(0.05, "npc"))) +
+          scale_x_continuous(breaks = breaks,
+                             labels = sprintf("%.2f", (breaks / 1000))) +
+          coord_cartesian(xlim = c(xmin, xmax),
+                          ylim = c(-ymax - (0.05 * ymax), ymax + (0.05 * ymax))) +
+          scale_linetype_manual(values = c(1,1)) +
+          theme_bw() +
+          ggtitle(paste0(lab, ": ", spec, " (", xcon,")")) +
+          geom_hline(yintercept = 0, color = "black") +
+          ylab("Depth per base per billion mapped nt") +
+          xlab("Position on contig (kbp)") +
+          theme(axis.title.x = element_text(size = 10),
+                axis.title.y = element_text(size = 10),
+                axis.text = element_text(color = "black", size = 10),
+                title = element_text(size = 8),
+                panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                strip.background = element_blank(),
+                strip.text = element_blank(),
+                legend.position = "none")
+        
+        print(pc)
+        
+        # # save each plot as a pdf
+        # fname <- paste(lab, paste0("contig",con),
+        #                paste0("group",xarr), "partial.pdf", sep = "_")
+        # ggsave(filename = fname,
+        #        plot = pc,
+        #        device = cairo_pdf,
+        #        dpi = 600,
+        #        width = 6,
+        #        height = 8)
+          
+      } # end codirectionality if statement   
+    }) # inner sapply statement
+  }) # end outer sapply statment
+  
+  # # create ordered pdf list by number of RNA-seq reads
+  # pdflist <- list.files(path = ".", pattern = paste(lab))
+  # # combine pdfs into a single file
+  # staplr::staple_pdf(input_files = pdflist,
+  #                    output_filepath = file.path(".", paste0(lab, "_tRNA_merged_q", qscore, "_context", context, "_min", mincov, ".pdf", sep = "")))
+  # # remove individual pdfs
+  # do.call(file.remove, list(pdflist))
+  
+}
+```
+
+### test plotting function on subset of contigs
+```{r}
+# testing
+plot_tss(lab = "US2",
+         covdat = US2_cov,
+         tdat = US2_tss |>
+           filter(contig == "NODE_105_length_119038_cov_87.324937"),
+         bindat = US2_bins,
+         gap = 100,
+         context = 100,
+         qscore = 30)
+```

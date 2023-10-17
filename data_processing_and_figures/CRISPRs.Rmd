@@ -1,0 +1,241 @@
+---
+title: "CRISPR analysis"
+output: html_notebook
+---
+
+## (install and) load libraries
+```{r}
+# devtools::install_github("acvill/CRISPRviewR")
+library(CRISPRviewR)
+library(tidyverse)
+library(stringr)
+library(staplr)
+```
+
+## read in CRISPR data
+```{r}
+get_crispr <- function(name) {
+  setwd(paste0("/workdir/users/acv46/stool_PROSeq3/annotation/", name, "_minced"))
+  CRISPRviewR::read_minced(txt = paste0(name,".txt"),
+                           gff = paste0(name,".gff"),
+                           fix_repeats = TRUE)
+}
+
+US2_crispr <- get_crispr("US2")
+US3_crispr <- get_crispr("US3")
+```
+
+## read in coverage data and subset for CRISPR arrays
+```{r}
+subset_cov <- function(name, crispr, context, qscore) {
+  
+  setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+  
+  subby <- crispr |>
+    dplyr::select(array, start, end, contig) |>
+    dplyr::mutate(length = as.double(stringr::str_match(string = contig,
+                                                        pattern = "length_\\s*(.*?)\\s*_cov")[,2])) |>
+    dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+                                                        pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    dplyr::group_by(array, contig, length) |>
+    dplyr::summarize(start = min(start), end = max(end)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(start = ifelse(start <= context,
+                                 yes = 1,
+                                 no = start - context),
+                  end = ifelse(end + context > length,
+                               yes = end,
+                               no = end + context))
+  
+  big <- readr::read_tsv(file = paste0(name,"_combined_q", qscore, "_backwards.txt"), # edited
+                  col_names = TRUE)
+  
+  # Normalization factors (per million mapped nt)
+  PROnorm <- (sum(dplyr::select(big, PRO_plus_full)) + sum(dplyr::select(big, PRO_minus_full))) / 10^9
+  RNAnorm <- (sum(dplyr::select(big, RNA_plus)) + sum(dplyr::select(big, RNA_minus))) / 10^9
+  TEXpnorm <- (sum(dplyr::select(big, TEXp_plus)) + sum(dplyr::select(big, TEXp_minus))) / 10^9
+  TEXmnorm <- (sum(dplyr::select(big, TEXm_plus)) + sum(dplyr::select(big, TEXm_minus))) / 10^9
+  
+  ### Approach 1: SLOW
+  # apply(X = subby, MARGIN = 1, function(x) {
+  #   big |> dplyr::filter(contig == x[1],
+  #                        position %in% x[4]:x[5])
+  #   }
+  # ) |> dplyr::bind_rows()
+  
+  ### Approach 2 : FASTER
+  subby |> tidyr::pivot_longer(cols = c(start, end),
+                               values_to = "position") |>
+    dplyr::select(contig, position) |>
+    dplyr::group_by(contig) |>
+    tidyr::complete(position = seq(from = min(position),
+                                   to = max(position))) |>
+    dplyr::left_join(big) |> ungroup() |>
+    dplyr::mutate(PRO_plus_full = PRO_plus_full / PROnorm,
+                  PRO_minus_full = PRO_minus_full / PROnorm,
+                  PRO_plus_3 = PRO_plus_3 / PROnorm,
+                  PRO_minus_3 = PRO_minus_3 / PROnorm,
+                  PRO_plus_5 = PRO_plus_5 / PROnorm,
+                  PRO_minus_5 = PRO_minus_5 / PROnorm,
+                  RNA_plus = RNA_plus / RNAnorm,
+                  RNA_minus = RNA_minus / RNAnorm,
+                  TEXp_plus = TEXp_plus / TEXpnorm,
+                  TEXp_minus = TEXp_minus / TEXpnorm,
+                  TEXm_plus = TEXm_plus / TEXmnorm,
+                  TEXm_minus = TEXm_minus / TEXmnorm)
+  
+  ### https://stackoverflow.com/q/74437717/7976890
+  
+}
+
+US2_cov <- subset_cov("US2", US2_crispr, 100, 30)
+US3_cov <- subset_cov("US3", US3_crispr, 100, 30)
+```
+
+## plot coverage across all arrays
+```{r}
+plot_arrays <- function(lab, covdat, crispr, qscore) {
+  
+  require(tidyverse)
+  require(stringr)
+  require(staplr)
+
+  arrays <- unique(crispr$array)
+  
+  sapply(arrays, function(x) {
+    
+           arr <- crispr |> dplyr::filter(array == x)
+           con <- (arr |> dplyr::slice(1) |> dplyr::select(contig) |>
+             stringr::str_match(pattern = "NODE_\\s*(.*?)\\s*_length"))[,2]
+           cov <- covdat |> dplyr::filter(contig == con) |>
+             tidyr::pivot_longer(cols = -c(contig,position),
+                                 names_to = "lib",
+                                 values_to = "value") |>
+             dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib),
+                                          yes = -1 * as.numeric(value), # flipped!
+                                          no = as.numeric(value))) |>
+             dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                           yes = "minus",
+                                           no = "plus")) |>
+             dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!
+                                                   grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!
+                                                   grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                                   grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                                   grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                                   grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+")) |>
+             dplyr::mutate(textpos = ifelse(strand == "plus", -1, 1))
+           
+           print(paste(lab, x, con, sep = ","))
+           
+           xmin <- min(cov$position)
+           xmax <- max(cov$position)
+           
+           breaks <- seq(from = xmin,
+                         to = xmax,
+                         by = round((xmax - xmin)/5, digits = 0))
+           
+           
+           
+           ymax <- cov |> select(value) |> abs() |> max()
+           
+           repeats <- data.frame(x1 = arr$start,
+                                 x2 = arr$end,
+                                 y1 = -ymax * 0.2,
+                                 y2 = ymax * 0.2, 
+                                 stringsAsFactors = F)
+
+           # whole <- data.frame(x1 = min(repeats$x1),
+           #                     x2 = max(repeats$x2),
+           #                     y1 = -ymax * 0.3,
+           #                     y2 = ymax * 0.3, 
+           #                     stringsAsFactors = F)
+           
+           # if (nrow(cas[which(cas$contig == contig),]) > 0){
+           # 
+           #   casbounds <- data.frame(x1 = cas[which(cas$contig == contig),]$start,
+           #                           x2 = cas[which(cas$contig == contig),]$end,
+           #                           label = cas[which(cas$contig == contig),]$gene,
+           #                           y1 = -ymax * 0.3,
+           #                           y2 = ymax * 0.3,
+           #                           stringsAsFactors = F)
+           # 
+           # }
+           
+           # if (nrow(prom[which(prom$contig == contig),]) > 0){
+           # 
+           #   prombounds <- data.frame(x1 = prom[which(prom$contig == contig),]$start,
+           #                           x2 = prom[which(prom$contig == contig),]$end,
+           #                           strand = prom[which(prom$contig == contig),]$strand,
+           #                           y1 = -ymax * 0.3,
+           #                           y2 = ymax * 0.3,
+           #                           stringsAsFactors = F)
+           # 
+           # }
+           
+            pc <- ggplot(data = cov) +
+              geom_area(mapping = aes(x = position, y = value, linetype = strand),
+              color = "#ff0000",
+              fill = "#ff0000") +
+              facet_grid(factor(type) ~ .) +
+              geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                                      y = ymax * 0.8,
+                                      label = type),
+                        hjust = 0, size = 3.5,
+                        check_overlap = TRUE) +
+              geom_rect(data = repeats,
+                        mapping = aes(xmin = x1, xmax = x2, ymin = y1, ymax = y2),
+                        fill = "black",
+                        alpha = 0.2,
+                        inherit.aes = FALSE) +
+              scale_x_continuous(breaks = breaks,
+                                 labels = sprintf("%.1f", (breaks / 1000))) +
+              coord_cartesian(xlim = c(xmin, xmax),
+                              ylim = c(-ymax - (0.02 * ymax), ymax + (0.02 * ymax))) +
+               # geom_segment(data = cuts,
+               #              mapping = aes(x = x, y = y, xend = xend, yend = yend),
+               #              size = 1,
+               #              arrow = arrow(length = unit(0.05, "npc")),
+               #              lineend = "butt", linejoin = "mitre", color = "black") +
+              scale_linetype_manual(values = c(1,1)) +
+              theme_bw() +
+              ggtitle(paste0(lab, ", ", x)) +
+              geom_hline(yintercept = 0, color = "black") +
+              ylab("Depth per base per billion mapped nt") +
+              xlab("Position on contig (kbp)") +
+              theme(axis.title.x = element_text(size = 10),
+                    axis.title.y = element_text(size = 10),
+                    title = element_text(size = 10),
+                    panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank(),
+                    strip.background = element_blank(),
+                    strip.text = element_blank(),
+                    legend.position = "none")
+
+           # save each plot as a pdf
+           fname <- paste(lab, x, "partial.pdf", sep = "_")
+           ggsave(filename = fname,
+                  plot = pc,
+                  device = cairo_pdf,
+                  dpi = 600,
+                  width = 6,
+                  height = 8)
+           
+         })
+  
+   # create ordered pdf list by number of RNA-seq reads
+   pdflist <- list.files(path = ".", pattern = paste(lab))
+   # combine pdfs into a single file
+   staplr::staple_pdf(input_files = pdflist,
+                      output_filepath = file.path(".", paste0(lab, "_crispr_merged_q", qscore, ".pdf",sep = "")))
+   # remove individual pdfs
+   do.call(file.remove, list(pdflist))
+  
+}
+```
+
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/CRISPR/")
+plot_arrays("US2", US2_cov, US2_crispr, 30)
+plot_arrays("US3", US3_cov, US3_crispr, 30)
+```
+

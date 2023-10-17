@@ -1,0 +1,353 @@
+---
+title: "E. coli PRO-seq revisited"
+output: html_notebook
+---
+
+## load libraries
+```{r}
+library(tidyverse)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("regutools")
+library(regutools)
+library(CRISPRviewR)
+```
+
+## move database cache
+```{r}
+# https://bioconductor.org/packages/devel/bioc/vignettes/AnnotationHub/inst/doc/TroubleshootingTheCache.html#default-caching-location-update
+    moveFiles<-function(package){
+        olddir <- path.expand(rappdirs::user_cache_dir(appname=package))
+        newdir <- tools::R_user_dir(package, which="cache")
+        dir.create(path=newdir, recursive=TRUE)
+        files <- list.files(olddir, full.names =TRUE)
+        moveres <- vapply(files,
+        FUN=function(fl){
+          filename = basename(fl)
+          newname = file.path(newdir, filename)
+          file.rename(fl, newname)
+        },
+        FUN.VALUE = logical(1))
+        if(all(moveres)) unlink(olddir, recursive=TRUE)
+    }
+
+
+    package="AnnotationHub"
+    moveFiles(package)
+```
+
+## load database
+```{r}
+require(regutools)
+## Build a regulondb object
+## stores database at /home/acv46/.cache/AnnotationHub
+if (!exists("regulondb_conn")) regulondb_conn <- connect_database()
+e_coli_regulondb <- regulondb(database_conn = regulondb_conn,
+                              organism = "E.coli",
+                              database_version = "11.0",
+                              genome_version = "NC_000913.3")
+```
+
+## get DNA Objects
+```{r}
+DNAObjs <- regutools::get_dataset(regulondb = e_coli_regulondb,
+                                  dataset = regutools::list_datasets(e_coli_regulondb)[1]) |>
+  as_tibble()
+
+DNAObjs |> filter(grepl(pattern = "CRISPR", x = description))
+```
+
+## read in minced results
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/Ecoli/minced")
+ec_minced <- CRISPRviewR::read_minced(gff = "ASM584v2_minced.gff",
+                                      txt = "ASM584v2_minced.txt",
+                                      fix_repeats = TRUE)
+```
+
+## read in coverage data
+```{r}
+setwd("/workdir/users/acv46/EC_PROSeq/")
+
+# PRO-seq and RNA-seq coverage data
+# use interation 2, see readme in file directory
+coverage <- read_csv(file = "pileup/iter_correct/all_coverage_formatted.txt", col_names = T)
+norm_pc <- coverage |> filter(type == "PRO-seq", end == "full", treatment == "control") |> select(value) |> sum()
+norm_ph <- coverage |> filter(type == "PRO-seq", end == "full", treatment == "heat shock") |> select(value) |> sum()
+norm_rc <- coverage |> filter(type == "RNA-seq", end == "full", treatment == "control") |> select(value) |> sum()
+norm_rh <- coverage |> filter(type == "RNA-seq", end == "full", treatment == "heat shock") |> select(value) |> sum()
+
+# flip and normalize
+coverage <- coverage |>
+  mutate(norm = case_when((type == "PRO-seq" & treatment == "control") ~ 10^9 * value / norm_pc,
+                          (type == "PRO-seq" & treatment == "heat shock") ~ 10^9 * value / norm_ph,
+                          (type == "RNA-seq" & treatment == "control") ~ 10^9 * value / norm_rc,
+                          (type == "RNA-seq" & treatment == "heat shock") ~ 10^9 * value / norm_rh)) |>
+  mutate(norm = ifelse(strand == "plus", -1 * norm, norm)) |>
+  mutate(end = case_when(end == "5" ~ "3",
+                         end == "3" ~ "5",
+                         end == "full" ~ "full")) |>
+  mutate(lib = paste(type, end)) |> select(position, lib, treatment, strand, norm)
+```
+
+## plot normalized coverage over CRISPR spacers, split by treatment
+```{r}
+plot_crispr <- function(mdat, covdat, arr, context) {
+  require(tidyverse)
+  boxes <- filter(mdat, array == arr) |>
+    select(start, end)
+  cover <- filter(covdat,
+                  position >= min(boxes$start) - context,
+                  position <= max(boxes$end) + context)
+  ymax <- max(abs(select(cover, norm)))
+  xmin <- min(select(cover, position))
+  xmax <- max(select(cover, position))
+  breaks <- seq(from = xmin,
+                to = xmax,
+                by = round((xmax - xmin)/6, digits = 0))
+  ggplot(data = cover) + 
+    geom_rect(data  = boxes,
+              mapping = aes(xmin = start, xmax = end,
+                            ymin = -0.2 * ymax, ymax = 0.2 * ymax),
+              fill = "gray70", color = "gray70",
+              inherit.aes = FALSE) +
+    geom_area(mapping = aes(x = position, y = norm),
+              color = "red") +
+    geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                            y = -ymax * 0.8,
+                            label = lib,
+                            hjust = 0),
+              size = 4,
+              check_overlap = TRUE) +
+    geom_hline(yintercept = 0, color = "black") +
+    facet_grid(lib ~ treatment) +
+    scale_x_continuous(breaks = breaks,
+                       labels = sprintf("%.1f", (breaks / 1000))) +
+    theme_bw() +
+    xlab("position (kbp)") +
+    ylab("Depth per billion mapped nt") +
+    theme(panel.grid = element_blank(),
+          panel.border = element_rect(color = "black", fill = "transparent"),
+          strip.background.y = element_blank(),
+          strip.text.y = element_blank(),
+          strip.background.x = element_rect(fill = "white", color = "white"),
+          strip.text.x = element_text(size = 12, color = "black"))
+}
+
+c1 <- plot_crispr(ec_minced, coverage, "CRISPR1", 100)
+c2 <- plot_crispr(ec_minced, coverage, "CRISPR2", 100)
+```
+
+### ggsave
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/Ecoli")
+ggsave(file = "Ecoli_CRISPR1_coverage_byTreatment_100_v2.pdf", plot = c1, height = 4, width = 8)
+ggsave(file = "Ecoli_CRISPR2_coverage_byTreatment_100_v2.pdf", plot = c2, height = 4, width = 8)
+```
+
+## CRISPR 2, control, 5' highlight
+```{r}
+plot_crispr5 <- function(mdat, covdat, arr, context) {
+  require(tidyverse)
+  boxes <- filter(mdat, array == arr) |>
+    select(start, end)
+  cover <- filter(covdat,
+                  position >= min(boxes$start) - context,
+                  position <= max(boxes$end) + context,
+                  treatment == "control",
+                  lib == "PRO-seq 5")
+  ymax <- max(abs(select(cover, norm)))
+  xmin <- min(select(cover, position))
+  xmax <- max(select(cover, position))
+  breaks <- seq(from = xmin,
+                to = xmax,
+                by = round((xmax - xmin)/6, digits = -2))
+  ggplot(data = cover) + 
+    geom_rect(data  = boxes,
+              mapping = aes(xmin = start, xmax = end,
+                            ymin = -0.2 * ymax, ymax = 0.2 * ymax),
+              fill = "gray70", color = "gray70",
+              inherit.aes = FALSE) +
+    geom_area(mapping = aes(x = position, y = norm),
+              color = "red") +
+    geom_hline(yintercept = 0, color = "black") +
+    scale_x_continuous(breaks = breaks) +
+                       # labels = sprintf("%.2f", (breaks / 1000))) +
+    theme_bw() +
+    xlab("position (kbp)") +
+    ylab("Depth per billion mapped nt") +
+    theme(panel.grid = element_blank(),
+          panel.border = element_rect(color = "black", fill = "transparent"),
+          strip.background.y = element_blank(),
+          strip.text.y = element_blank(),
+          strip.background.x = element_rect(fill = "white", color = "white"),
+          strip.text.x = element_text(size = 12, color = "black"))
+}
+
+c2_5 <- plot_crispr5(ec_minced, coverage, "CRISPR2", 100)
+c2_5
+```
+
+### ggsave
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/Ecoli")
+ggsave(file = "Ecoli_array2_crispr5_coverage_control_100_v1.pdf", plot = c2_5, height = 4, width = 6)
+```
+
+### interrogate position of 5' peaks
+```{r}
+coverage |> filter(position >= ec_minced |> filter(array == "CRISPR2") |> select(start) |> min(),
+                   position <= ec_minced |> filter(array == "CRISPR2") |> select(end) |> max()) |>
+  filter(lib == "PRO-seq 3", treatment == "control", strand == "plus") |>
+  select(position,norm) |> View()
+```
+
+## plot normalized coverage over CRISPR spacers, split by array
+```{r}
+plot_crispr2 <- function(mdat, covdat, treat, context) {
+  require(tidyverse)
+  boxes <- mdat |> select(array, start, end)
+  cover <- filter(covdat,
+                  position >= min(boxes$start) - context,
+                  position <= max(boxes$end) + context)
+  ymax <- max(abs(select(cover, norm)))
+  xmin <- min(select(cover, position))
+  xmax <- max(select(cover, position))
+  breaks <- seq(from = xmin,
+                to = xmax,
+                by = round((xmax - xmin)/6, digits = 0))
+  ggplot(data = cover) + 
+    geom_rect(data  = boxes,
+              mapping = aes(xmin = start, xmax = end,
+                            ymin = -0.2 * ymax, ymax = 0.2 * ymax),
+              fill = "gray70", color = "gray70",
+              inherit.aes = FALSE) +
+    geom_area(mapping = aes(x = position, y = norm),
+              color = "red") +
+    geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                            y = -ymax * 0.8,
+                            label = lib,
+                            hjust = 0),
+              size = 4,
+              check_overlap = TRUE) +
+    geom_hline(yintercept = 0, color = "black") +
+    facet_grid(lib ~ treatment) +
+    scale_x_continuous(breaks = breaks,
+                       labels = sprintf("%.1f", (breaks / 1000))) +
+    theme_bw() +
+    xlab("position (kbp)") +
+    ylab("Depth per billion mapped nt") +
+    theme(panel.grid = element_blank(),
+          panel.border = element_rect(color = "black", fill = "transparent"),
+          strip.background.y = element_blank(),
+          strip.text.y = element_blank(),
+          strip.background.x = element_rect(fill = "white", color = "white"),
+          strip.text.x = element_text(size = 12, color = "black"))
+}
+
+cc1 <- plot_crispr2(ec_minced, coverage, "control", 100)
+cc2 <- plot_crispr2(ec_minced, coverage, "heat shock", 100)
+
+cc1
+cc2
+```
+
+### ggsave
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/Ecoli")
+ggsave(file = "Ecoli_CRISPR1_coverage_byArray_100_v2.pdf", plot = cc1, height = 4, width = 8)
+ggsave(file = "Ecoli_CRISPR2_coverage_byArray_100_v2.pdf", plot = cc2, height = 4, width = 8)
+```
+
+## get cas genes
+```{r}
+casgenes <- DNAObjs |>
+  filter(grepl(pattern = "Cas|CRISPR", x = description)) |>
+  mutate(molecule = "NC_000913.3",
+         gene = name,
+         start = posleft,
+         end = posright,
+         orientation = ifelse(strand == "forward", 1, -1)) |>
+  select(molecule, gene, start, end, strand, orientation) |>
+  mutate(middle = (start + end)/2)
+```
+
+## plot coverage over cas genes
+```{r}
+plot_genes <- function(gdat, covdat, context) {
+  require(tidyverse)
+  require(gggenes)
+  require(patchwork)
+  xmin <- min(select(gdat, start)) - context
+  xmax <- max(select(gdat, end)) + context
+  breaks <- seq(from = xmin,
+                to = xmax,
+                by = round((xmax - xmin)/5, digits = 0))
+  cover <- filter(covdat,
+                  position >= min(casgenes$start) - context,
+                  position <= max(casgenes$end) + context)
+  ymax <- max(abs(select(cover, norm)))
+  trace <- ggplot(data = cover) + 
+    geom_area(mapping = aes(x = position, y = norm),
+              color = "red") +
+    geom_text(mapping = aes(x = xmax - ((xmax - xmin) %/% 40),
+                            y = ymax * 0.4,
+                            label = lib),
+                        hjust = 1, size = 3,
+                        check_overlap = TRUE) +
+    geom_hline(yintercept = 0, color = "black") +
+    facet_grid(lib ~ .) +
+    scale_x_continuous(breaks = breaks,
+                       labels = sprintf("%.1f", (breaks / 1000))) +
+    theme_bw() +
+    xlab("position (kbp)") +
+    ylab("Depth per billion mapped nt") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_blank(),
+          strip.background = element_blank(),
+          strip.text = element_blank(),
+          panel.grid = element_blank(),
+          panel.border = element_rect(color = "black", fill = "transparent"))
+  genes <- ggplot(data = casgenes,
+                  mapping = aes(xmin = start,
+                                xmax = end,
+                                x = middle,
+                                y = molecule,
+                                fill = gene, 
+                                label = gene,
+                                forward = orientation)) +
+    gggenes::geom_gene_arrow() +
+    scale_fill_brewer(palette = "Set3") +
+    geom_text(angle = -90, hjust = -0.5, vjust = 0.3, size = 4) +
+    scale_x_continuous(breaks = breaks,
+                       labels = sprintf("%.1f", (breaks / 1000)),
+                       limits = c(xmin,xmax)) +
+    theme_genes() +
+    xlab("position (kbp)") +
+    theme(axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          legend.position = "none",
+          axis.text.x = element_text(color = "black", size = 10))
+  
+  trace / genes + plot_layout(heights = c(2, 1))
+  
+}
+
+gco <- plot_genes(gdat = casgenes,
+           covdat = coverage |> filter(treatment == "control"),
+           context = 100)
+ghs <- plot_genes(gdat = casgenes,
+           covdat = coverage |> filter(treatment == "heat shock"),
+           context = 100)
+```
+
+### ggsave
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/Ecoli")
+ggsave(file = "Ecoli_cas_coverage_control_100_v2.pdf", plot = gco, height = 4, width = 6)
+ggsave(file = "Ecoli_cas_coverage_heatshock_100_v2.pdf", plot = ghs, height = 4, width = 6)
+```
+
+
+

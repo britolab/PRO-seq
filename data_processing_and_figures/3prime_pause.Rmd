@@ -1,0 +1,1209 @@
+---
+title: "3p peaks"
+output: html_notebook
+---
+
+## load libraries
+```{r}
+library(tidyverse)
+```
+
+## read in binstats data
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+
+# merged_bins <- bind_rows(
+#   US2_bins |> mutate(sample = "US2"),
+#   US3_bins |> mutate(sample = "US3")
+# )
+```
+
+## read in scaffold2bin mapping
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly")
+get_map <- function(data) {
+  read_tsv(file = data,
+           col_names = c("contig","bin"), show_col_types = FALSE)
+}
+
+US2_scaff2bins <- get_map("US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt")
+US3_scaff2bins <- get_map("US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt")
+```
+
+## merge bindat and contig mappings
+```{r}
+merge_all <- function(bins, scaff2bins) {
+  left_join(scaff2bins, bins, by = "bin") |>
+     mutate(contig = str_remove(pattern = "NODE_",
+                                string = str_remove(pattern = "_length.*",
+                                                    string = contig)))
+}
+
+US2_merged <- merge_all(US2_bins, US2_scaff2bins)
+US3_merged <- merge_all(US3_bins, US3_scaff2bins)
+rm(US2_bins, US3_bins, US2_scaff2bins, US3_scaff2bins)
+```
+
+## read in and modify 3' PRO-seq coverage data (read in file if saved)
+```{r}
+# do not create new object, read in file with code below
+
+library(tidyverse)
+get_coverage <- function(file, vector) {
+
+  require(readr)
+  require(dplyr)
+  
+  # file is the coverage file
+  # vector is a vector of contigs for positive subsetting
+  
+  read_tsv(file = file, col_names = T) |>
+    select(contig, position, PRO_plus_3, PRO_minus_3) |> 
+    pivot_longer(c(PRO_minus_3, PRO_plus_3), names_to = "strand", values_to = "value") |> 
+    mutate(strand = str_remove(string = str_remove(string = strand, pattern = "PRO_"), pattern = "_3")) 
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/")
+US2_3p <- get_coverage("US2_combined_q30_correct.txt")
+US3_3p <- get_coverage("US3_combined_q30_correct.txt")
+# write_tsv(US2_3p, "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US2_3p_correct.txt")
+# write_tsv(US3_3p, "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US3_3p_correct.txt")
+```
+
+## read in fasta and subset for contigs in bin set
+```{r}
+get_fasta <- function(fasta, mergedat) {
+  
+  require(Biostrings)
+  fasta <- readDNAStringSet(filepath = fasta,
+                            format = "fasta")
+  contigs <- unique(mergedat$contig)
+  
+  fasta <- fasta[which(names(fasta) %in% contigs)]
+  fasta
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly")
+US2_fasta <- get_fasta("US2_25May2022/metaSPAdes/contigs_simple.fasta", US2_merged)
+US3_fasta <- get_fasta("US3_25May2022/metaSPAdes/contigs_simple.fasta", US3_merged)
+```
+
+## identify 3' pause sites, filter by score, pull sequences
+```{r}
+# To do
+## fix bind_rows call to get both minus and plus strand results
+## incorporate GTF data for genetic context annotation of pause sites
+## parallelize apply calls
+## rewrite to use single apply call over bin-contig pair instead of two apply calls, for better pbapply reporting
+
+# from Sun 2021 -- "ends of all uniquely mapped RNA reads (bottom lane) were determined and the read count for each 3′ end position was calculated and plotted (top lane). The genomic positions where 3’ end/3’ end median (51-bp window) read counts ratio (pause score) was ≥ 20 and read counts/10^6 reads was ≥ 10 satisfied our stringent definition for a pause site."
+
+# main function to process each contig in the chosen bin set
+get_motifs <- function(covdat, bindat, seqdat, range, mincov, minpause, context, method) {
+  
+  # INPUTS
+  ## covdat is coverage data
+  ## bindat is all metadata
+  ## seqdat is genomic ranges object containing all sequence data
+  ## range is the context around a position to use in pause score calculation
+  ## mincov is the minimum raw coverage value at a position to determine whether a pause score should be calculated
+  ## minpause is the the minimum Z score for a position to call it as significantly paused
+  ## context is the number of bases surrounding a significant peak
+  ## method is either mean or adjusted median ("mad") -- used in Z score calculation
+  ## strand is "plus" or "minus"
+  
+  require(tidyverse)
+  require(stats)
+  require(Biostrings)
+  #require(pbapply)
+  
+  # helper function to get pause site z score
+  ###########################################
+  pause_score <- function(row, full, range, con_len, method){
+    
+    pos <- row[2] |> as.numeric()
+  
+    # this code works with both circular and linear sequences
+    fullrange <- sort(c(
+      c(((pos - 1) - c(1:range)) %% con_len + 1),
+      c(((pos - 1) + c(1:range)) %% con_len + 1)
+      ))
+    
+    # ADD 1 TO EVERY POSITION TO AVOID INF Z SCORES
+    if (method == "mean") {
+    
+      mean <- full |>
+        filter(position %in% fullrange) |>
+        select(value) |> abs() |>
+        unlist() |> base::mean()
+    
+      std <- full |>
+        filter(position %in% fullrange) |>
+        select(value) |> abs() |>
+        unlist() |> stats::sd()
+    
+      # calculate z score for pause sites passing raw cov threshold
+      zscore <- (abs(as.numeric(row[4])) - mean) / (std + (1/sqrt(range)))
+    
+      list(zscore, as.numeric(row[2]))
+    
+    } else if (method == "mad") {
+  
+      mean <- full |>
+        filter(position %in% fullrange) |>
+        select(value) |> abs() |>
+        unlist() |> base::mean()
+    
+      mad <- full |>
+        filter(position %in% fullrange) |>
+        select(value) |> abs() |>
+        unlist() |> stats::mad()
+    
+      # calculate z score for pause sites passing raw cov threshold
+      zscore <- (abs(as.numeric(row[4])) - mean) / (mad + (1/sqrt(range)))
+    
+      list(zscore, as.numeric(row[2]))
+      
+    }
+      
+  }
+  ###########################################
+  
+  # for each bin, apply function to constituent contigs
+  results <-
+    bind_rows(
+    lapply(bindat |> 
+             filter(completeness > 90, contamination < 5) |> 
+             select(bin) |> unique() |> unlist(),
+         function(i) {
+           
+           message(paste0("\n","Loading coverage data for bin ", i))
+           
+           contig_list <- bindat |> filter(bin == i) |>
+             select(contig) |> unlist()
+           bin_cov <- read_tsv(covdat,
+                               col_names = TRUE,
+                               show_col_types = FALSE) |>
+             filter(contig %in% contig_list)
+           
+           bind_rows(
+           lapply(contig_list,
+                  function(j) {
+                    
+                    message(paste0("\n","Procesing bin ", i, ", contig ", j))
+                    
+                    # subset coverage data by contig and sequence end type
+                    con_cov <- filter(bin_cov, contig == j)
+                    con_len <- max(con_cov$position) 
+                    index <- c((range + 1):(con_len - range - 1))
+                    cseq <- seqdat[j][[1]]
+                    
+                    # get strand-wise z scores for peaks passing raw coverage threshold
+                    # eliminate peaks with overlapping ranges by only keeping larger peak
+                    ## this is needed to prevent the same sequence from being pulled more than once
+                      
+                    # PLUS STRAND
+                    
+                    plus_set <- con_cov |>
+                      filter(strand == "plus" &
+                               abs(value) >= mincov &
+                               position %in% index)
+                    
+                    plus_z <- tibble()
+                    
+                    if (nrow(plus_set) > 0) {
+
+                      plus_z <- tibble(z = rep(NA, nrow(plus_set)),
+                                       position = rep(NA, nrow(plus_set)))
+                      hold <- apply(X = plus_set,
+                                    MARGIN = 1,
+                                    FUN = pause_score,
+                                    full = con_cov |> filter(strand == "plus"),
+                                    range = range,
+                                    con_len = con_len,
+                                    method = method)
+  
+                      plus_z$z <- do.call(rbind, hold)[,1] |> unlist()
+                      plus_z$position <- do.call(rbind, hold)[,2] |> unlist()
+                      plus_z <- plus_z |>
+                        mutate(startrng = position - context) |>
+                        mutate(endrng = position + context) |>
+                        arrange(startrng) |>
+                        filter(z >= minpause)
+  
+                      message(paste0("\n","--> plus strand has ", nrow(plus_z), " hits over Z-score threshold"))
+  
+                      plus_z$grp <- 1
+                      if (nrow(plus_z) > 1) {
+                        for (k in 2:nrow(plus_z)) {
+  
+                          if (plus_z$endrng[k - 1] >= plus_z$startrng[k]) {
+  
+                            plus_z$grp[k] <- plus_z$grp[k - 1]
+  
+                          } else {
+  
+                            plus_z$grp[k] <- plus_z$grp[k - 1] + 1
+  
+                          }
+                        }
+                      }
+  
+                      message(paste0("\n","----> plus strand has ", nrow(plus_z), " hits remaining after overlap removal"))
+  
+                      if (nrow(plus_z) > 0) {
+                        plus_z <- plus_z |>
+                          group_by(grp) |>
+                          top_n(1, z) |>
+                          ungroup() |>
+                          mutate(bin = i) |>
+                          mutate(contig = j) |>
+                          mutate(strand = "plus")
+                          plus_z$sequence <- apply(X = plus_z, MARGIN = 1,
+                                                   FUN = function(x) {
+                                                     cseq[x[3]:x[4]] |>
+                                                       as.character()
+                                                     }
+                                                   )
+                          
+                        plus_z
+                        
+                      }
+                    }
+                    
+                    # MINUS STRAND
+  
+                    minus_set <- con_cov |>
+                      filter(strand == "minus" &
+                               abs(value) >= mincov &
+                               position %in% index)
+                    
+                    minus_z <- tibble()
+
+                    if (nrow(minus_set) > 0) {
+
+                      minus_z <- tibble(z = rep(NA, nrow(minus_set)),
+                                        position = rep(NA, nrow(minus_set)))
+                      hold <- apply(X = minus_set,
+                                    MARGIN = 1,
+                                    FUN = pause_score,
+                                    full = con_cov |> filter(strand == "minus"),
+                                    range = range,
+                                    con_len = con_len,
+                                    method = method)
+
+                      minus_z$z <- do.call(rbind, hold)[,1] |> unlist()
+                      minus_z$position <- do.call(rbind, hold)[,2] |> unlist()
+                      minus_z <- minus_z |>
+                        mutate(startrng = position - context) |>
+                        mutate(endrng = position + context) |>
+                        arrange(startrng) |>
+                        filter(z >= minpause)
+
+                      message(paste0("\n","--> minus strand has ", nrow(minus_z), " hits over Z-score threshold"))
+
+                      minus_z$grp <- 1
+                      if (nrow(minus_z) > 1) {
+                        for (k in 2:nrow(minus_z)) {
+
+                          if (minus_z$endrng[k - 1] >= minus_z$startrng[k]) {
+
+                            minus_z$grp[k] <- minus_z$grp[k - 1]
+
+                          } else {
+
+                            minus_z$grp[k] <- minus_z$grp[k - 1] + 1
+
+                          }
+                        }
+                      }
+
+                      message(paste0("\n","----> minus strand has ", nrow(minus_z), " hits remaining after overlap removal"))
+
+                      if (nrow(minus_z) > 0) {
+                        minus_z <- minus_z |>
+                          group_by(grp) |>
+                          top_n(1, z) |>
+                          ungroup() |>
+                          mutate(bin = i) |>
+                          mutate(contig = j) |>
+                          mutate(strand = "minus")
+                          minus_z$sequence <- apply(X = minus_z, MARGIN = 1,
+                                                   FUN = function(x) {
+                                                     cseq[x[3]:x[4]] |>
+                                                       reverseComplement() |>
+                                                       as.character()
+                                                     }
+                                                   )
+                        minus_z
+                      }
+                    }
+                     
+                    bind_rows(plus_z, minus_z)
+                       
+                  })) # end apply over contig list
+           
+         })) 
+  
+  return(results)
+}
+```
+
+## run get_motifs as background jobs
+```{r}
+US2_3peaks <- get_motifs(covdat = "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US2_3p_correct.txt",
+                         bindat = US2_merged,
+                         seqdat = US2_fasta,
+                         range = 25,
+                         mincov = 10,
+                         minpause = 5,
+                         context = 20,
+                         method = "mean")
+library(readr)
+write_csv(x = US2_3peaks,
+          file = "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US2_peaks3_25r_10c_5z_20s_mean.csv",
+          col_names = T)
+
+US3_3peaks <- get_motifs(covdat = "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US3_3p_correct.txt",
+                         bindat = US3_merged,
+                         seqdat = US3_fasta,
+                         range = 25,
+                         mincov = 10,
+                         minpause = 5,
+                         context = 20,
+                         method = "mean")
+library(readr)
+write_csv(x = US3_3peaks,
+          file = "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US3_peaks3_25r_10c_5z_20s_mean.csv",
+          col_names = T)
+```
+
+## transform get_motifs results to fasta, split by bin
+```{r}
+# https://bootstrappers.umassmed.edu/guides/main/r_writeFasta.html
+writeFasta <- function(data, filename){
+  fastaLines = c()
+  for (rowNum in 1:nrow(data)){
+    fastaLines = c(fastaLines, as.character(data[rowNum,"header"]))
+    fastaLines = c(fastaLines,as.character(data[rowNum,"sequence"]))
+  }
+  fileConn <- file(filename)
+  writeLines(fastaLines, fileConn)
+  close(fileConn)
+}
+
+# RNA pol occupies -11 to +5
+trunc_and_split <- function(peakdat, seqstart, seqstop) {
+  bins <- unique(peakdat$bin)
+  lapply(bins, function(bin_) {
+    fasta <- dplyr::filter(peakdat, bin == bin_) |>
+      dplyr::mutate(sequence = substr(sequence,
+                                      start = seqstart,
+                                      stop = seqstop)) |>
+      mutate(header = paste(paste0(">", bin), contig, strand,
+                            paste0(startrng + 9, "-", endrng - 15),
+                            round(z, 2),
+                            sep = "|"))
+      writeFasta(data = fasta,
+                 filename = paste0(bin_, "_3peaks.fasta"))
+  })
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/pause/metalogo/US2_fasta")
+trunc_and_split(US2_3peaks, 10, 26)
+
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/pause/metalogo/US3_fasta")
+trunc_and_split(US3_3peaks, 10, 26)
+```
+
+## implement clustering and consensus logo visualization
+```{r}
+cluster_seqs <- function(peakdat, bindat, covdat, sample, bini, top) {
+  binset <- dplyr::filter(peakdat, bin == bini)
+  labdat <- dplyr::filter(bindat, bin == bini)
+  contig_list <- dplyr::select(binset, contig) |> unlist() |> unique()
+  bin_cov <- dplyr::filter(covdat, contig %in% contig_list)
+  
+  # function to get unique values from a tibble column
+  uval <- function(dat, param) {
+    dplyr::select(dat, {{param}}) |>
+      purrr::as_vector() |>
+      base::unique()
+  }
+  
+  # function to create a -11,+5 metaplot
+  metaplot <- function(plist_, medz_, bin_cov_) {
+   apply(plist_, 1, function(posj) {
+     pleft <- as.numeric(posj[[1]]) - 10
+     pright <- as.numeric(posj[[1]]) + 5
+     dplyr::filter(bin_cov_,
+                   contig == posj[[2]],
+                   strand == posj[[3]],
+                   position %in% c(pleft:pright)) |>
+       dplyr::mutate(index = position - as.numeric(posj[[1]])) |> 
+       dplyr::mutate(value = (value - min(value)) + 1)
+     }) |> dplyr::bind_rows() |>
+      ggplot2::ggplot() +
+      ggplot2::geom_point(mapping = ggplot2::aes(x = index, y = log(value,2)),
+                          alpha = 0.3) +
+      ggplot2::geom_smooth(mapping = ggplot2::aes(x = index, y = log(value,2)),
+                           method = "loess", span = 0.2) +
+      ggplot2::scale_x_continuous(breaks = -10:5,
+                                  labels = c(paste0("-",11:1), paste0("+",1:5))) + 
+      ggplot2::theme_classic() +
+      ggplot2::annotate(geom = "text", x = 5, y = Inf,
+                        hjust = 1, vjust = 1, size = 3, 
+                        label = paste0("med. Z = ", medz_)) +
+      ggplot2::xlab("") +
+      ggplot2::ylab("") +
+      ggplot2::scale_y_continuous(position = "right")
+    }
+  
+  totpeaks <- nrow(binset)
+  # subset to -11 and +5 around peak
+  # shift to left to get correct peak position (10,25) -> (11,26)
+  seqs <- dplyr::select(binset, sequence) |> 
+    dplyr::mutate(sequence = substr(sequence,
+                                    start = 11,
+                                    stop = 26)) |>
+    purrr::as_vector()
+  seqlen <- unique(nchar(seqs))
+  if (length(seqlen) > 1) {
+    message("Error: sequences should all be the same length")
+    stop()
+  }
+  # if adjusted pairwise levenshtein distance is less than cutoff ratio,
+  # put spacers in same cluster
+  dmat <- Biostrings::DNAStringSet(seqs) |>
+    Biostrings::stringDist(method = "levenshtein") / seqlen
+  # dynamically choose distance cutoff as median norm distance + 2 sd
+  cdist <- round(median(dmat) + (2*stats::sd(dmat)), digits = 2)
+  clusters <- dplyr::tibble(sequence = seqs,
+                            cluster = stats::hclust(dmat, method = "complete") |>
+                              stats::cutree(h = cdist))
+  group <- dplyr::bind_cols(dplyr::select(binset, -sequence), clusters)
+  nclust <- length(table(group$cluster))
+  if (nclust < top) {
+    topset <- sort(table(group$cluster), decreasing = TRUE)[1:nclust]
+  } else {
+    topset <- sort(table(group$cluster), decreasing = TRUE)[1:top]
+  }
+  topplots <- list()
+  for (i in 1:length(topset)) {
+    iclust <- dplyr::filter(group, cluster == names(topset[i]))
+    poslist <- dplyr::select(iclust, position, contig, strand, z)
+    medz <- round(stats::median(poslist$z),2)
+    mplot <- metaplot(poslist, medz, bin_cov)
+    if (i < length(topset)) {
+      logo <- dplyr::select(iclust, sequence) |>
+        ggseqlogo::ggseqlogo() +
+        ggplot2::theme(axis.text.x = ggplot2::element_blank()) +
+        ggplot2::annotate(geom = "text", x = -Inf, y = Inf, hjust = 0, vjust = 1,
+                 label = paste(topset[i],"/",totpeaks,"seqs"))
+      topplots[[i]] <- patchwork::wrap_plots(mplot, logo, nrow = 2, ncol = 1)
+    } else {
+      logo <- dplyr::select(iclust, sequence) |>
+        ggseqlogo::ggseqlogo() +
+        ggplot2::scale_x_continuous(breaks = 1:16,
+                           labels=c(paste0("-",11:1), paste0("+",1:5))) +
+        ggplot2::annotate(geom = "text", x = -Inf, y = Inf, hjust = 0, vjust = 1,
+                 label = paste(topset[i],"/",totpeaks,"seqs"))
+      topplots[[i]] <- patchwork::wrap_plots(mplot, logo, nrow = 2, ncol = 1)
+    }
+  }
+  plot_title <- paste0(sample," bin \"",
+                       bini, "\", ",
+                       uval(labdat, phylum), ", ",
+                       uval(labdat, species))
+  plot_subtitle <- paste0(uval(labdat, completeness), "% complete, ",
+                          uval(labdat, contamination), "% contamination, ",
+                          "cluster distance cutoff = ", cdist)
+  patchwork::wrap_plots(topplots, nrow = top, ncol = 1) + 
+    patchwork::plot_annotation(title = plot_title,
+                               subtitle = plot_subtitle,
+                               theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 11)))
+}
+
+# # test
+# cluster_seqs(peakdat = US2_3peaks_redo_mad,
+#              bindat = US2_merged,
+#              covdat = "/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US2_3p_correct.txt",
+#              "US2", "83", 3)
+```
+
+## loop cluster_seqs for all HQ bins
+```{r}
+logos2pdf <- function(peakdat_, bindat_, covdat_, sample_, top_, outfile) {
+  require(grDevices)
+  binlist <- base::unique(peakdat_$bin)
+  lapply(binlist, function(bin_) {
+    message(paste0("Processing sample: ", sample_, ", bin: ", bin_))
+    binplot <- cluster_seqs(
+      peakdat = peakdat_,
+      bindat = bindat_,
+      covdat = covdat_,
+      sample = sample_,
+      bini = bin_,
+      top = top_)
+    fname <- paste(sample_, bin_, paste0("top",top_),
+                   "partial.pdf", sep = "_")
+    ggplot2::ggsave(filename = fname,
+                    plot = binplot,
+                    device = cairo_pdf,
+                    dpi = 600,
+                    width = 5,
+                    height = 9)
+    message(paste0("Finished sample: ", sample_, ", bin: ", bin_))
+  })
+  pdflist <- list.files(path = ".", pattern = "partial.pdf")
+  # combine pdfs into a single file
+  staplr::staple_pdf(input_files = pdflist,
+                     output_filepath = file.path(".", outfile))
+  do.call(file.remove, list(pdflist))
+  message(paste0("Created merged PDF for sample "))
+}
+
+# RUN AS BACKGROUND JOB
+# setwd("/workdir/users/acv46/stool_PROSeq3/figures/pause/custom_clust")
+# logos2pdf(peakdat_ = US2_3peaks, bindat_ = US2_merged, sample_ = "US2", top_ = 3,
+#           outfile = "US2_HQbins_logos_shift1_top3_2sd_v1.pdf")
+# logos2pdf(peakdat_ = US3_3peaks, bindat_ = US3_merged, sample_ = "US3", top_ = 3,
+#           outfile = "US3_HQbins_logos_shift1_top3_2sd_v1.pdf")
+```
+
+### create test objects
+```{r}
+test_binset <- dplyr::filter(US2_3peaks_redo_mean, bin == "US2_25May2022.020")
+test_labdat <- dplyr::filter(US2_merged, bin == "US2_25May2022.020")
+test_contig_list <- select(test_binset, contig) |> unlist() |> unique()
+test_bin_cov <- filter(read_tsv("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup/US2_3p_correct.txt", col_names = T),
+                       contig %in% test_contig_list)
+uval <- function(dat, param) {
+  dplyr::select(dat, {{param}}) |>
+    purrr::as_vector() |>
+    base::unique()
+}
+test_totpeaks <- nrow(test_binset)
+test_seqs <- dplyr::select(test_binset, sequence) |> 
+  dplyr::mutate(sequence = substr(sequence,
+                                  start = 11,
+                                  stop = 26)) |>
+  purrr::as_vector()
+test_seqlen <- unique(nchar(test_seqs))
+if (length(test_seqlen) > 1) {
+  message("Error: sequences should all be the same length")
+  stop()
+}
+test_dmat <- Biostrings::DNAStringSet(test_seqs) |>
+  Biostrings::stringDist(method = "levenshtein") / test_seqlen
+# dynamically choose distance cutoff as median norm distance + 2 sd
+test_cdist <- round(median(test_dmat) + (2*stats::sd(test_dmat)), digits = 2)
+test_clusters <- dplyr::tibble(sequence = test_seqs,
+                               cluster = stats::hclust(test_dmat, method = "complete") |>
+                                 stats::cutree(h = test_cdist))
+test_group <- dplyr::bind_cols(dplyr::select(test_binset, -sequence), test_clusters)
+test_nclust <- length(table(test_group$cluster))
+if (test_nclust < 3) {
+  test_topset <- sort(table(test_group$cluster), decreasing = TRUE)[1:test_nclust]
+} else {
+  test_topset <- sort(table(test_group$cluster), decreasing = TRUE)[1:3]
+}
+
+```
+
+### function: given peakset, get coverage context and make metaplot
+```{r}
+test_topplots <- list()
+
+metaplot <- function(plist_, medz_) {
+   apply(plist_, 1, function(posj) {
+    pleft <- as.numeric(posj[[1]]) - 10
+    pright <- as.numeric(posj[[1]]) + 5
+    filter(test_bin_cov,
+           contig == posj[[2]],
+           strand == posj[[3]],
+           position %in% c(pleft:pright)) |>
+      mutate(index = position - as.numeric(posj[[1]])) |> 
+      mutate(value = (value - min(value)) + 1)
+    }) |> bind_rows() |>
+    ggplot() +
+    geom_point(mapping = aes(x = index, y = log(value,2)), alpha = 0.3) +
+    geom_smooth(mapping = aes(x = index, y = log(value,2)),method = "loess", span = 0.2) +
+    scale_x_continuous(breaks = -10:5,
+                       labels = c(paste0("-",11:1), paste0("+",1:5))) + 
+    theme_classic() +
+    annotate(geom = "text", x = 5, y = Inf,
+             hjust = 1, vjust = 1, size = 3, 
+             label = paste0("med. Z = ", medz_)) +
+    xlab("") +
+    ylab("") +
+    scale_y_continuous(position = "right")
+}
+
+for (i in 1:length(test_topset)) {
+    test_iclust <- dplyr::filter(test_group, cluster == names(test_topset[i]))
+    test_poslist <- select(test_iclust, position, contig, strand, z)
+    medz <- round(stats::median(test_poslist$z),2)
+    mplot <- metaplot(test_poslist, medz)
+    if (i < length(test_topset)) {
+      logo <- dplyr::select(test_iclust, sequence) |>
+        ggseqlogo::ggseqlogo() +
+        ggplot2::theme(axis.text.x = ggplot2::element_blank()) +
+        ggplot2::annotate(geom = "text", x = -Inf, y = Inf, hjust = 0, vjust = 1,
+                 label = paste(test_topset[i],"/",test_totpeaks,"seqs")) +
+        ylab("")
+      test_topplots[[i]] <- patchwork::wrap_plots(mplot, logo, nrow = 2, ncol = 1)
+    } else {
+      logo <- dplyr::select(test_iclust, sequence) |>
+        ggseqlogo::ggseqlogo(stack_width = ) +
+        ggplot2::scale_x_continuous(breaks = 1:16,
+                           labels=c(paste0("-",11:1), paste0("+",1:5))) +
+        ggplot2::annotate(geom = "text", x = -Inf, y = Inf, hjust = 0, vjust = 1,
+                 label = paste(test_topset[i],"/",test_totpeaks,"seqs")) +
+        ylab("")
+      test_topplots[[i]] <- patchwork::wrap_plots(mplot, logo, nrow = 2, ncol = 1)
+    }
+  }
+# plot_title <- paste0(sample," bin \"",
+#                      bini, "\", ",
+#                      uval(labdat, phylum), ", ",
+#                      uval(labdat, species))
+# plot_subtitle <- paste0(uval(labdat, completeness), "% complete, ",
+#                         uval(labdat, contamination), "% contamination, ",
+#                         "cluster distance cutoff = ", cdist)
+patchwork::wrap_plots(test_topplots, nrow = 3, ncol = 1) + 
+  patchwork::plot_annotation(title = "test",
+                             subtitle = "test",
+                             theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 11)))
+
+
+# apply(test_poslist, 1, function(posj) {
+#   pleft <- as.numeric(posj[[1]]) - 10
+#   pright <- as.numeric(posj[[1]]) + 5
+#   filter(test_bin_cov,
+#          contig == posj[[2]],
+#          strand == posj[[3]],
+#          position %in% c(pleft:pright)) |>
+#     mutate(index = position - as.numeric(posj[[1]])) |> 
+#     mutate(value = (value - min(value)) + 1)
+#   }) |> bind_rows() |> 
+# ggplot() +
+#   geom_point(mapping = aes(x = index, y = log(value,2)), alpha = 0.3) +
+#   geom_smooth(mapping = aes(x = index, y = log(value,2)),method = "loess", span = 0.2) +
+#   scale_x_continuous(breaks = -10:5,
+#                      labels = c(paste0("-",11:1), paste0("+",1:5))) + 
+#   theme_classic() +
+#   annotate(geom = "text", x = -10, y = Inf,
+#            hjust = 0, vjust = 1, size = 6, 
+#            label = paste0("med. Z = ", medz1))
+```
+
+### plot test
+```{r}
+test_out1 |> ggplot() +
+  geom_point(mapping = aes(x = index, y = log(value,2)), alpha = 0.3) +
+  geom_smooth(mapping = aes(x = index, y = log(value,2)),method = "loess", span = 0.2) +
+  scale_x_continuous(breaks = -10:5,
+                     labels=c(paste0("-",11:1), paste0("+",1:5))) + theme_classic() +
+  annotate(geom = "text", x = -10, y = Inf, hjust = 0, vjust = 1, label = paste0("med. Z = ", medz1), size = 6)
+  
+# test_out2 |> ggplot() +
+#   geom_point(mapping = aes(x = index, y = log(value,2)), alpha = 0.3) +
+#   geom_smooth(mapping = aes(x = index, y = log(value,2)),method = "loess", span = 0.2) +
+#   scale_x_continuous(breaks = -10:5,
+#                      labels=c(paste0("-",11:1), paste0("+",1:5))) + theme_classic()
+```
+
+
+
+## subset peaks for those that overlap tRNAs
+
+### read in tRNAs and find anticodon center
+```{r}
+read_tRNA <- function(gff3, ffn, binname) {
+  
+  require(tidyverse)
+  # require(ncRNAtools)
+  cnames <- c("contig","drop1","feature","start","end","drop2","strand","drop3","attribute")
+  anames <- c("ID","drop4","drop5","drop6","drop7","gene","anticodon","amino_acid")
+  
+  tdat <- readr::read_tsv(file = gff3, comment = "#",
+                          col_names = cnames, show_col_types = FALSE) |>
+    dplyr::filter(feature == "tRNA") |>
+    dplyr::filter(!grepl("product=tRNA-Xxx|pseudo=True",attribute)) |>
+    tidyr::separate(attribute, into = anames, sep = ";") |>
+    dplyr::select(-c(feature, dplyr::contains("drop"))) |>
+    dplyr::mutate(ID = stringr::str_remove(ID, "ID=")) |>
+    dplyr::mutate(gene = stringr::str_remove(gene, "gene=")) |>
+    dplyr::mutate(amino_acid = stringr::str_remove(amino_acid, "amino_acid=")) |>
+    dplyr::mutate(anticodon = toupper(stringr::str_remove(anticodon, "anti_codon="))) |>
+    dplyr::filter(!is.na(anticodon)) |>
+    dplyr::mutate(bin = binname)
+  
+  if (nrow(tdat) > 0) {
+  
+    tIDs <- unique(as.vector(tdat$ID))
+    
+    fasta <- Biostrings::readDNAStringSet(filepath = ffn, format = "fasta")
+    out <- dplyr::tibble(seq = as.character(fasta), ID = sub(" .*", "", names(fasta))) |>
+      dplyr::filter(ID %in% tIDs) |>
+      dplyr::right_join(tdat, by = "ID")
+      # dplyr::mutate(structure = ncRNAtools::predictSecondaryStructure(sequence = gsub("T", "U", seq),
+      #                                                                 inferenceEngine = "BL",
+      #                                                                 method = "centroidHomFold")$secondaryStructure)
+    
+    # find center position of anticodon in tRNA gene range
+    apply(out, 1, function(x, expect = 34) {
+      seq_ <- x[[1]]
+      ac_ <- x[[8]]
+      hits <- unlist(gregexpr(text = seq_, pattern = ac_))
+      if (length(hits) > 1) {
+        pos <- hits[which(abs(hits - expect) == min(abs(hits - expect)))] + 1
+      } else {
+        pos <- hits + 1
+      }
+      c(x, center = pos)
+    }) |> t() |> 
+      dplyr::as_tibble() |>
+      dplyr::mutate(start = as.numeric(start),
+                    end = as.numeric(end),
+                    center = start + as.numeric(center) - 1)
+  
+  }
+}
+
+combine_tRNA <- function(path) {
+  
+  bins <- list.files(path)
+  lapply(bins, function(bin) {
+    message(bin)
+    read_tRNA(gff3 = paste0(path,bin,"/",bin,".gff3"),
+              ffn = paste0(path,bin,"/",bin,".ffn"),
+              binname = bin)
+  }) |> dplyr::bind_rows()
+}
+
+US2_tRNA <- combine_tRNA("/workdir/users/acv46/stool_PROSeq3/annotation/US2_bins_bakta_1.7/")
+US3_tRNA <- combine_tRNA("/workdir/users/acv46/stool_PROSeq3/annotation/US3_bins_bakta_1.7/")
+```
+
+### read in peakdat and flip strands
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+US2_3peaks <- readr::read_csv(file = "US2_peaks3_25r_10c_5z_20s_mean.csv",
+                              show_col_types = FALSE,
+                              col_names = T) |>
+  dplyr::mutate(strand = ifelse(strand == "plus", "-", "+"))
+US3_3peaks <- readr::read_csv(file = "US3_peaks3_25r_10c_5z_20s_mean.csv",
+                              show_col_types = FALSE,
+                              col_names = T) |>
+  dplyr::mutate(strand = ifelse(strand == "plus", "-", "+"))
+```
+
+### subset for peaks coincident with tRNAs, merge with bindat
+```{r}
+find_tRNA_peaks <- function(tRNA, peaks, bindat) {
+  
+  apply(tRNA, 1, function(x) {
+  
+    seq_    <- x[[1]]
+    start_  <- x[[4]]
+    end_    <- x[[5]]
+    contig_ <- as.double(stringr::str_match(string = x[[3]],
+                                            pattern = "NODE_\\s*(.*?)\\s*_length")[,2])
+    strand_ <- x[[6]]
+    ac_     <- x[[8]]
+    aa_     <- x[[9]]
+    center_ <- x[[11]]
+    
+    # opposite strand, peaks on wrong side
+    peaks |> dplyr::filter(position %in% start_:end_,
+                           contig == contig_,
+                           strand == strand_) |>
+      dplyr::mutate(tRNA_start = as.numeric(start_),
+                    tRNA_end = as.numeric(end_),
+                    anticodon_center = as.numeric(center_),
+                    tRNA_seq = seq_,
+                    anticodon = ac_,
+                    amino_acid = aa_)
+  
+  }) |> dplyr::bind_rows() |>
+    
+    dplyr::left_join(dplyr::select(bindat, contig, bin, completeness, contamination, phylum, species) |>
+                       dplyr::mutate(contig = as.double(contig)), 
+                     by = c("contig", "bin")) |>
+    dplyr::select(-grp)
+  
+}
+
+
+US2_tpeaks <- find_tRNA_peaks(US2_tRNA, US2_3peaks, US2_merged)
+US3_tpeaks <- find_tRNA_peaks(US3_tRNA, US3_3peaks, US3_merged)
+```
+
+### plot tRNA peak distribution for select bins
+```{r}
+plot_tpeaks <- function(dat, peaks, sample, outfile) {
+  
+  # dat is tpeaks data
+  # peaks is the minimum number of tRNA-coincident peaks required to plot a bin
+  
+  require(tidyverse)
+  require(ggseqlogo)
+  require(patchwork)
+  
+  seqcol <- ggseqlogo::make_col_scheme(chars = c('N', 'A', 'C', 'G', 'U'),
+                                       cols = c('white','#109648','#255C99','#F7B32B','#D62839'))
+
+  plotdat <- group_by(dat, bin) |> filter(n() >= peaks) |>
+    mutate(shift = anticodon_center - position) |> ungroup()
+  bins_   <- unique(plotdat$bin)
+  
+  lapply(bins_, function(bin_) {
+    
+    ##### DATA
+    
+    bdat <- filter(plotdat, bin == bin_) |>
+      mutate(leftshift = anticodon_center - tRNA_start,
+             rightshift = tRNA_end - anticodon_center) |>
+      mutate(leftfill = max(leftshift) - leftshift,
+             rightfill = max(rightshift) - rightshift)
+    
+    xrng_ <- c(-1*max(bdat$leftshift),max(bdat$rightshift))
+    xbreaks_ <- seq(-35,55,5)
+    nt <- nrow(bdat)
+    spec_ <- unique(bdat$species)
+    fname <- paste(sample, paste0(peaks,"min"),
+                   gsub(x = spec_, pattern = " ", replacement = "_"), "partial.pdf", sep = "_")
+    
+    bdat2 <- bdat |>
+      mutate(tRNA_seq = paste0(strrep("-",as.integer(leftfill)),
+                               tRNA_seq,
+                               strrep("-",as.integer(rightfill)))) |>
+      mutate(index = row_number())
+    
+    maxleft <- max(bdat2$leftshift)
+    
+    bdat3 <- bdat2 |>
+      mutate(index = row_number()) |>
+      mutate(seq_trim = gsub(x = stringr::str_sub(tRNA_seq, max(leftfill) + 1), pattern = "-", replace = "")) |>
+      mutate(seq_len = nchar(seq_trim)) |>
+      mutate(seq_trim = gsub(x = stringr::str_sub(seq_trim, 1, min(seq_len)),
+                             pattern = "T", replacement = "U")) |>
+      mutate(structure = purrr::map_chr(.x = seq_trim,
+                                        .f = function(x) {
+                                          ncRNAtools::predictSecondaryStructure(sequence = x,
+                                                                                method = "centroidFold")[[2]]
+                                          })) |>
+      select(structure) |> separate(structure, sep = "", into = paste0("pos",sprintf('%0.2d', 0:100))) |>
+      mutate(pos00 = NA) |> select_if(~ !any(is.na(.))) |> pivot_longer(names_to = "position", cols = everything()) |>
+      mutate(position = as.numeric(gsub("pos", "", x = position)) - maxleft, value = ifelse(value == ".", 0, 1)) |> 
+      filter(value != 0) |> group_by(position) |> count(value)
+      
+    
+    smax <- select(bdat, shift)
+    
+    ##### PLOTS
+    
+    p0 <- ggplot(bdat3) +
+      geom_bar(mapping = aes(x = position, y = n),
+               stat = "identity",
+               width = 0.8,
+               fill = "gray60") +
+      scale_x_continuous(breaks = xbreaks_,limits = xrng_) +
+      ylab("pairing propensity") +
+      theme_bw() +
+      # geom_vline(xintercept = -1.5, color = "black") +
+      # geom_vline(xintercept = 1.5, color = "black") +
+      theme(axis.text = element_text(color = "black"),
+            axis.title.x = element_blank(),
+            axis.title.y = element_text(color = "black", size = 7),
+            axis.ticks = element_line(color = "black", linewidth = 0.5),
+            panel.grid.minor = element_blank(),
+            panel.grid.major.x = element_blank(),
+            plot.margin=grid::unit(c(0,0,0,0), "mm"))
+    
+    p1 <- mutate(bdat2, leftmax = max(leftshift)) |>
+      separate_rows(tRNA_seq, sep = "") |>
+      filter(tRNA_seq != "") |> group_by(index) |>
+      mutate(xpos = row_number() - leftmax - 1,
+             tRNA_seq = ifelse(tRNA_seq == "T", "U", tRNA_seq)) |>
+      ungroup() |>
+      ggplot() +
+      geom_raster(mapping = aes(y = index, x = xpos, fill = tRNA_seq),
+                  alpha = 0.7) +
+      scale_fill_manual(values = c('grey60','#109648','#255C99','#F7B32B','#D62839')) +
+      geom_text(mapping = aes(y = index, x = xpos, label = tRNA_seq),
+                size = 2,
+                family = "mono",
+                color = "black") +
+      geom_text(mapping = aes(y = index, label = amino_acid, x = min(xpos)),
+                #x = Inf,
+                size = 2,
+                family = "mono",
+                color = "black",
+                hjust = 1) +
+      scale_x_continuous(breaks = xbreaks_, limits = xrng_) +
+      geom_vline(xintercept = -1.5, color = "black") +
+      geom_vline(xintercept = 1.5, color = "black") +
+      theme_void() +
+      theme(legend.position = "none",
+            plot.background = element_rect(fill = "transparent", color = NA))
+    
+    p2 <- bdat2 |>
+      select(tRNA_seq,tRNA_start,tRNA_end,anticodon_center,
+             rightfill,leftfill,index) |>
+      mutate(seq_trim = paste0(strrep("N",max(leftfill)),
+                               stringr::str_sub(tRNA_seq, max(leftfill) + 1))) |>
+      mutate(ncount = stringr::str_count(seq_trim, "-")) |>
+      mutate(seq_trim = paste0(stringr::str_sub(seq_trim, 1, -max(ncount) - 1),
+                               strrep("N",max(ncount)))) |> select(seq_trim) |>
+      mutate(seq_trim = gsub(x = seq_trim, pattern = "T", replacement = "U")) |>
+      ggseqlogo(col_scheme = seqcol, seq_type = "rna") +
+      theme_bw() +
+      theme(axis.text.x = element_blank(),
+            axis.text.y = element_text(color = "black"),
+            axis.ticks.y = element_line(color = "black", linewidth = 0.5),
+            axis.ticks.x = element_blank(), 
+            panel.grid.major.x  = element_blank(),
+            panel.grid.minor = element_blank(),
+            axis.title = element_text(size = 7),
+            plot.margin=grid::unit(c(0,0,0,0), "mm"))
+        
+    p3 <- select(bdat, shift) |>
+      ggplot() +
+      geom_bar(mapping = aes(x = shift),
+               width = 0.8,
+               fill = "black") +
+      scale_x_continuous(breaks = xbreaks_,limits = xrng_) +
+      ylab("3' peak count") +
+      xlab("position relative to anticodon center") +
+      theme_bw() +
+      # geom_vline(xintercept = -1.5, color = "black") +
+      # geom_vline(xintercept = 1.5, color = "black") +
+      theme(axis.text = element_text(color = "black"),
+            axis.title = element_text(color = "black", size = 7),
+            axis.ticks = element_line(color = "black", linewidth = 0.5),
+            panel.grid.minor = element_blank(),
+            panel.grid.major.x = element_blank(),
+            plot.margin=grid::unit(c(0,0,0,0), "mm"))
+     
+   pout <- p0 / p1 / p2 / p3 +
+     patchwork::plot_layout(heights = c(1, nt/5, 1, 1)) +
+     patchwork::plot_annotation(title = paste0(sample, ", ", spec_))
+   
+   pout
+   
+   ggsave(filename = fname,
+          plot = pout,
+          device = cairo_pdf,
+          dpi = 600,
+          width = 8,
+          height = nt/4)
+    
+  })
+  
+  # get list of pdf files
+  glob <- glob2rx(paste0(sample,"*_partial.pdf"))
+  pdflist <- list.files(path = ".", pattern = glob)
+  staplr::staple_pdf(input_files = pdflist,
+                     output_filepath = file.path(".", outfile))
+  if (file.exists(outfile)) {
+    do.call(file.remove, list(pdflist))
+  }
+
+}
+  
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/tRNA/3pause")
+plot_tpeaks(US2_tpeaks, 20, "US2", "US2_tRNA_3p_20min_v8.pdf")
+#plot_tpeaks(US3_tpeaks, 20, "US3", "US3_tRNA_3p_20min_v8.pdf")
+
+# plot_tpeaks(US2_tpeaks |> filter(bin == "36_sub"), 20, "US2", "US2_tRNA_3p_20min_v7.pdf")
+```
+### scratch
+```{r}
+
+US2_tpeaks |> group_by(bin) |> filter(n() >= 20) |>
+    mutate(shift = anticodon_center - position) |> ungroup() |>
+    filter(bin == "36_sub") |>
+  slice(1) |> select(tRNA_seq) |> gsub(pattern = "T", replacement = "U") |>
+  ncRNAtools::predictSecondaryStructure(method = "centroidFold") |>
+  pluck(2) |> write()
+
+###
+teststruct <- US2_tpeaks |>
+    group_by(bin) |> filter(n() >= 20) |>
+    mutate(shift = anticodon_center - position) |> ungroup() |>
+    filter(bin == "36_sub") |>
+    mutate(leftshift = anticodon_center - tRNA_start,
+           rightshift = tRNA_end - anticodon_center) |>
+    mutate(leftfill = max(leftshift) - leftshift,
+           rightfill = max(rightshift) - rightshift) |>
+    mutate(tRNA_seq = paste0(strrep("-",as.integer(leftfill)),
+                             tRNA_seq,
+                             strrep("-",as.integer(rightfill)))) |>
+    mutate(index = row_number()) |>
+    mutate(seq_trim = gsub(x = stringr::str_sub(tRNA_seq, max(leftfill) + 1), pattern = "-", replace = "")) |>
+    mutate(seq_len = nchar(seq_trim)) |>
+    mutate(seq_trim = gsub(x = stringr::str_sub(seq_trim, 1, min(seq_len)), pattern = "T", replacement = "U")) |>
+  mutate(structure = purrr::map_chr(.x = seq_trim,
+                                                        .f = function(x) 
+                                                          {
+                                                          ncRNAtools::predictSecondaryStructure(sequence = x,
+                                                                                                method = "centroidFold")[[2]]
+                                                          }))
+
+teststruct |> separate(structure, sep = "", into = paste0("pos",sprintf('%0.2d', 0:100))) |> mutate(pos01 = NA) |> select_if(~ !any(is.na(.))) |> select(-c(tRNA_seq, tRNA)) -> teststruct2
+
+teststruct2 |> pivot_longer(names_to = "position", cols = everything()) |> group_by(position) |> count(value) |> top_n(1) |> ungroup() |> select(value) |> as_vector() |> base::unname() |> paste0(collapse = "")
+```
+
+
+### scratch2
+```{r}
+require(tidyverse)
+require(Biostrings)
+require(DECIPHER)
+require(R4RNA)
+require(ggmsa)
+
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/pause/")
+
+pss <- Vectorize(ncRNAtools::predictSecondaryStructure)
+
+# get secondary structures
+teststruct <- US2_tpeaks |>
+    group_by(bin) |> filter(n() >= 20) |>
+    mutate(shift = anticodon_center - position) |> ungroup() |>
+    filter(bin == "36_sub") |>
+    mutate(leftshift = anticodon_center - tRNA_start,
+           rightshift = tRNA_end - anticodon_center) |>
+    mutate(leftfill = max(leftshift) - leftshift,
+           rightfill = max(rightshift) - rightshift) |>
+    mutate(tRNA_seq = paste0(strrep("-",as.integer(leftfill)),
+                             tRNA_seq,
+                             strrep("-",as.integer(rightfill)))) |>
+    mutate(index = row_number()) |>
+    select(tRNA_seq,tRNA_start,tRNA_end,anticodon_center,rightfill,leftfill,index) |>
+    mutate(seq_trim = gsub(x = stringr::str_sub(tRNA_seq, max(leftfill) + 1), pattern = "-", replace = "")) |>
+    mutate(seq_len = nchar(seq_trim)) |>
+    mutate(seq_trim = gsub(x = stringr::str_sub(seq_trim, 1, min(seq_len)), pattern = "T", replacement = "U")) |>
+  select(seq_trim) |> mutate(structure = purrr::map_chr(.x = seq_trim,
+                                                        .f = function(x) 
+                                                          {
+                                                          ncRNAtools::predictSecondaryStructure(sequence = x,
+                                                                                                method = "centroidFold")[[2]]
+                                                          }))
+
+# get ggseqlogo consensus
+US2_tpeaks |>
+  group_by(bin) |> filter(n() >= 20) |>
+  mutate(shift = anticodon_center - position) |> ungroup() |>
+  filter(bin == "36_sub") |>
+  mutate(leftshift = anticodon_center - tRNA_start,
+         rightshift = tRNA_end - anticodon_center) |>
+  mutate(leftfill = max(leftshift) - leftshift,
+         rightfill = max(rightshift) - rightshift) |>
+  mutate(tRNA_seq = paste0(strrep("-",as.integer(leftfill)),
+                           tRNA_seq,
+                           strrep("-",as.integer(rightfill)))) |>
+  mutate(index = row_number()) |>
+  select(tRNA_seq,tRNA_start,tRNA_end,anticodon_center,rightfill,leftfill,index) |>
+  mutate(seq_trim = gsub(x = stringr::str_sub(tRNA_seq, max(leftfill) + 1), pattern = "-", replace = "")) |>
+  mutate(seq_len = nchar(seq_trim)) |>
+  mutate(seq_trim = gsub(x = stringr::str_sub(seq_trim, 1, min(seq_len)), pattern = "T", replacement = "U")) |>
+  ggseqlogo()
+
+# get arc diagrams
+testcon <- US2_tpeaks |>
+  group_by(bin) |> filter(n() >= 20) |>
+  mutate(shift = anticodon_center - position) |> ungroup() |>
+  filter(bin == "36_sub") |>
+  mutate(leftshift = anticodon_center - tRNA_start,
+         rightshift = tRNA_end - anticodon_center) |>
+  mutate(leftfill = max(leftshift) - leftshift,
+         rightfill = max(rightshift) - rightshift) |>
+  mutate(tRNA_seq = paste0(strrep("-",as.integer(leftfill)),
+                               tRNA_seq,
+                               strrep("-",as.integer(rightfill)))) |>
+      mutate(index = row_number()) |>
+  select(tRNA_seq,tRNA_start,tRNA_end,anticodon_center,rightfill,leftfill,index) |>
+  mutate(seq_trim = gsub(x = stringr::str_sub(tRNA_seq, max(leftfill) + 1), pattern = "-", replace = "")) |>
+  mutate(seq_len = nchar(seq_trim)) |>
+  mutate(seq_trim = stringr::str_sub(seq_trim, 1, min(seq_len))) |>
+  select(seq_trim) |> as_vector() |> Biostrings::DNAStringSet()
+
+testdot <- DECIPHER::PredictDBN(DECIPHER::AlignSeqs(testcon))[1]
+write(testdot, file = "test_structure.txt")
+testhelix <- R4RNA::readVienna(file = "test_structure.txt")
+testarc <- R4RNA::plotHelix(testhelix)
+```
+
+### scratch3
+```{r}
+# library(Biostrings)
+# library(ncRNAtools)
+# library(dplyr)
+# library(purrr)
+
+sequence <-
+  c(glnU = "TGGGGTATCGCCAAGCGGTAAGGCACCGGTTTTTGATACCGGCATTCCCTGGTTCGAATCCAGGTACCCCAGCCA",
+    glnV = "TGGGGTATCGCCAAGCGGTAAGGCACCGGATTCTGATTCCGGCATTCCGAGGTTCGAATCCTCGTACCCCAGCCA",
+    glnW = "TGGGGTATCGCCAAGCGGTAAGGCACCGGTTTTTGATACCGGCATTCCCTGGTTCGAATCCAGGTACCCCAGCCA",
+    glnX = "TGGGGTATCGCCAAGCGGTAAGGCACCGGATTCTGATTCCGGCATTCCGAGGTTCGAATCCTCGTACCCCAGCCA",
+    trpT = "AGGGGCGTAGTTCAATTGGTAGAGCACCGGTCTCCAAAACCGGGTGTTGGGAGTTCGAGTCTCTCCGCCCCTGCCA")
+
+structure <-
+  purrr::map_chr(.x = sequence,
+                 .f = function(seq) {
+                   toU <- gsub(x = seq, pattern = "T", replacement = "U")
+                   ncRNAtools::predictSecondaryStructure(sequence = toU,
+                                                         method = "centroidFold")[[2]]
+                   }
+                 ) |> as_tibble() |> dplyr::mutate(sequence = sequence) |> rename(structure = value)
+```
+
+
+### function for generate forna coloring string from sequence
+```{r}
+forna_colors <- function(sequence, colormap) {
+  inseq <- gsub(x = strsplit(toupper(as.character(sequence)),split="")[[1]],
+                pattern="T",
+                replacement="U")
+  index <- paste0(1:length(inseq),":")
+  c(rbind(index,inseq)) |>
+    gsub(pattern = names(colormap[1]), replacement = paste0(tolower(colormap[1])," ")) |>
+    gsub(pattern = names(colormap[2]), replacement = paste0(tolower(colormap[2])," ")) |>
+    gsub(pattern = names(colormap[3]), replacement = paste0(tolower(colormap[3])," ")) |>
+    gsub(pattern = names(colormap[4]), replacement = paste0(tolower(colormap[4])," ")) |>
+    paste0(collapse = "") |> trimws()
+}
+
+US2_CTG_Gln <- US2_tpeaks |> filter(bin == "36_sub", anticodon == "CTG", amino_acid == "Gln") |> select(tRNA_seq)
+US3_CTG_Gln <- US3_tpeaks |> filter(bin == "bin.427", anticodon == "CTG", amino_acid == "Gln") |> select(tRNA_seq)
+hex <- c(A = "#5BB57E", G = "#F8C966", C = "#668DB7", U = "#E26674")
+forna_colors(US2_CTG_Gln, hex)
+forna_colors(US3_CTG_Gln, hex)
+```
+
+### function to generate values for forna gradient fill
+```{r}
+forna_gradient <- function(data, range, maxp) {
+  mutate(data, shift = anticodon_center - position) |> 
+    filter(shift %in% range) |>
+    select(shift) |> table() |> as.data.frame() |> as_tibble() |>
+    mutate(shift = as.numeric(as.character(shift))) |>
+    right_join(tibble(shift = c(range)), by = "shift") |>
+    mutate(Freq = ifelse(is.na(Freq), 0, Freq)) |> arrange(shift) |>
+    mutate(prop = Freq / maxp) |> select(prop) |>
+    as_vector() |> paste0(collapse = " ")
+}
+
+forna_gradient(filter(US2_tpeaks, bin == "36_sub"), -33:39, 5)
+forna_gradient(filter(US3_tpeaks, bin == "bin.427"), -33:42, 5)
+```
+

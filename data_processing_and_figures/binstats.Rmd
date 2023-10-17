@@ -1,0 +1,326 @@
+---
+title: "binstats and QC data"
+output: html_notebook
+---
+
+# This notebook contains code to visualize bin statistics from the clean_assemble_bin.sh pipeline
+
+## load tidyverse
+```{r}
+library(tidyverse)
+```
+
+## read in binstats data
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE)
+
+merged_bins <- bind_rows(
+  US2_bins |> mutate(sample = "US2"),
+  US3_bins |> mutate(sample = "US3")
+)
+```
+
+## arrange and select columns
+```{r}
+viewbins <- function(bindat) {
+  
+  bindat |> arrange(desc(percent_community)) |>
+    select(bin, genus, species, percent_community, Mbp, completeness, contamination) |>
+    View()
+  
+}
+
+viewbins(US2_bins)
+viewbins(US3_bins)
+```
+
+## simple pie chart to visualize phylum abundance
+```{r}
+drawpie <- function(bindat, title, cutoff) {
+  
+  bindat |> select(bin, percent_community, genus) |>
+    group_by(genus) |> summarize(total = sum(percent_community)) |>
+    mutate(genus = ifelse(total < cutoff, paste0("other (< ", cutoff, "%)"), genus)) |>
+    group_by(genus) |> summarize(sum = sum(total)) |>
+    ungroup() |> mutate(genus = ifelse(is.na(genus), "unknown", genus)) |>
+    ggplot(data, mapping = aes(x = "", y = as.numeric(sum), fill = genus)) +
+    geom_col(width = 1, color = "white") +
+    coord_polar(theta = "y", start = 0) +
+    theme_void() +
+    ggtitle(paste0(title, " Community Abundance")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_fill_brewer(palette = "Set1")
+  
+}
+
+drawpie(US2_bins, "US2", 2)
+drawpie(US3_bins, "US3", 2)
+```
+
+## faceted bar charts for merged data -- GENUS
+```{r}
+drawbar_g <- function(bindat, cutoff, palette) {
+  
+  bindat |> select(sample, bin, percent_community, genus) |>
+    group_by(sample, genus) |> summarize(total = sum(percent_community)) |>
+    mutate(genus = ifelse(total < cutoff, paste0("other (< ", cutoff, "% community)"), genus)) |>
+    group_by(sample, genus) |> summarize(sum = sum(total)) |>
+    ungroup() |> mutate(genus = ifelse(is.na(genus), "unbinned or unknown at genus level", genus)) |>
+    mutate(genus = factor(genus, levels = c("Acetatifactor","Agathobacter","CAG-245","Coprococcus","Dialister","ER4","Faecalibacterium",
+                                            "Alistipes","Bacteroides","Muribaculum","Parabacteroides","Phocaeicola","Prevotella",
+                                            paste0("other (< ", cutoff, "% community)"),
+                                            "unbinned or unknown at genus level"))) |>
+    
+    ggplot(mapping = aes(x = sample, y = as.numeric(sum), fill = genus)) +
+    geom_bar(position = "fill", stat = "identity") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_fill_manual(values = palette) +
+    theme_classic() +
+    ylab("CheckM Percent Community") +
+    labs(fill = "GTDB genus") +
+    theme(axis.text = element_text(color = "black", size = 15),
+          axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.title = element_text(color = "black", size = 12),
+          legend.text = element_text(color = "black", size = 9),
+          legend.box.background = element_rect(size = 1.5, color = "black"),
+          legend.key.size = unit(0.5, "cm"))
+  
+}
+
+cpal1 <- c("#2de1c2ff", "#3b28ccff", "#9eb7e5ff", "#648de5ff", "#304c89ff",
+          "#FFC53A", "#E06D06",
+          "#848C8E", "#040F16")
+cpal2 <- c("#8e0152",
+"#c51b7d",
+"#de77ae",
+"#f1b6da",
+"#fde0ef",
+"#b8e186",
+"#4d9221",
+"gray50",
+"black")
+cpal3 <- c("#fee8c8","#fdd49e","#fdbb84","#fc8d59","#ef6548","#d7301f","#990000",
+           "#c7e9c0","#a1d99b","#74c476","#41ab5d","#238b45","#005a32",
+           "gray50","black")
+g1 <- drawbar_g(merged_bins, 1, cpal3)
+
+g1
+
+# setwd("/workdir/users/acv46/stool_PROSeq3/figures/binstats")
+# ggsave(filename = "binned_populations_genus_4.pdf", plot = g1,
+#        width = 5, height = 4)
+```
+
+## completeness and contamination plot for binned orgs
+```{r}
+require(tidyverse)
+require(grid)
+require(gridExtra)
+require(wesanderson)
+require(patchwork)
+plotdat <- merged_bins |>
+  mutate(phylum = ifelse(test = grepl(pattern = "Firmicutes", x = phylum),
+                         yes = "Bacillota",
+                         no = phylum)) |>
+  mutate(phylum = ifelse(test = grepl(pattern = "Desulfobacterota", x = phylum),
+                         yes = "Desulfobacterota",
+                         no = phylum)) |>
+  mutate(phylum = ifelse(test = is.na(phylum),
+                         yes = "no phylum annotation",
+                         no = phylum)) |>
+  mutate(phylum = factor(phylum, levels = c("Actinobacteriota","Bacillota","Bacteroidota",
+                                            "Desulfobacterota","Proteobacteria","Verrucomicrobiota",
+                                            "no phylum annotation")))
+
+tab2 <- plotdat |> filter(completeness >= 90, contamination <= 5, sample == "US2") |>
+  arrange(completeness) |> select(bin, species)
+
+tab3 <- plotdat |> filter(completeness >= 90, contamination <= 5, sample == "US3") |>
+  arrange(completeness) |> select(bin, species)
+
+s2 <- ggplot(plotdat) +
+  annotate("rect", xmin = 90, xmax = 100,
+           ymin = 0, ymax = 5,
+           fill = "white") +
+  geom_jitter(mapping = aes(x = completeness,
+                            y = contamination + 0.01,
+                            color = phylum)) +
+  facet_grid(sample ~ .) + 
+  geom_text(mapping = aes(label = paste(sample, "bins"), x = 10, y = 50, hjust = 0.1),
+            check_overlap = TRUE,
+            size = 6) +
+  ylab("% Contamination + 0.01") +
+  xlab("% Completeness") +
+  scale_y_log10(limits = c(0.01,100),
+                labels = function(x) sprintf("%g", x),
+                expand = c(0.01,0.01)) +
+  scale_x_continuous(expand = c(0.01,0.01)) +
+  scale_color_manual(values = c(wes_palettes$Darjeeling1[c(1:2)], wes_palettes$BottleRocket2[1],
+                                wes_palettes$Darjeeling1[c(5,4)], wes_palettes$IsleofDogs1[c(1,4)])) +
+  annotation_logticks(scaled = TRUE, sides = "l") +
+  labs(color = "GTDB phylum") +
+  theme(axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(color = "black", size = 12),
+        legend.title = element_text(color = "black", size = 12),
+        legend.text = element_text(color = "black", size = 10),
+        legend.box.background = element_rect(size = 1, color = "black"),
+        legend.position = "bottom",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(fill = "transparent", color = "black"),
+        panel.background = element_rect(fill = "gray80")) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  geom_vline(xintercept = 90, color = "gray50") +
+  geom_hline(yintercept = 5, color = "gray50")
+
+s2
+# setwd("/workdir/users/acv46/stool_PROSeq3/figures/binstats")
+# ggsave(filename = "bin_complete_contam_scatter_v4.pdf", plot = s1,
+#        width = 8, height = 4)
+```
+
+## completeness and contamination plot for binned orgs
+```{r}
+require(tidyverse)
+require(grid)
+require(gridExtra)
+require(wesanderson)
+require(patchwork)
+plotdat <- merged_bins |>
+  mutate(phylum = ifelse(test = grepl(pattern = "Firmicutes", x = phylum),
+                         yes = "Bacillota",
+                         no = phylum)) |>
+  mutate(phylum = ifelse(test = grepl(pattern = "Desulfobacterota", x = phylum),
+                         yes = "Desulfobacterota",
+                         no = phylum)) |>
+  mutate(phylum = ifelse(test = is.na(phylum),
+                         yes = "no phylum annotation",
+                         no = phylum)) |>
+  mutate(phylum = factor(phylum, levels = c("Actinobacteriota","Bacillota","Bacteroidota",
+                                            "Desulfobacterota","Proteobacteria","Verrucomicrobiota",
+                                            "no phylum annotation"))) |>
+  filter(completeness >= 90, contamination <= 5)
+
+s3 <- ggplot(plotdat) +
+  geom_jitter(mapping = aes(x = completeness,
+                            y = contamination + 0.01,
+                            fill = phylum),
+              size = 3,
+              shape = 21,
+              color = "black") +
+  facet_grid(. ~ sample) + 
+  # geom_text(mapping = aes(label = paste(sample, "bins"), x = 90, y = .02, hjust = 0.1),
+  #           check_overlap = TRUE,
+  #           size = 6) +
+  ylab("% Contamination + 0.01") +
+  xlab("% Completeness") +
+  scale_y_log10(limits = c(0.01,5),
+                labels = function(x) sprintf("%g", x),
+                expand = c(0.01,0.01)) +
+  scale_x_continuous(limits = c(89.5,100.5),
+                     breaks = seq(90,100,5)) +
+  scale_fill_manual(values = c(wes_palettes$Darjeeling1[c(1:3,6)])) +
+  annotation_logticks(scaled = TRUE, sides = "l") +
+  labs(color = "GTDB phylum") +
+  theme_bw() +
+  theme(axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(color = "black", size = 12),
+        legend.title = element_text(color = "black", size = 12),
+        legend.text = element_text(color = "black", size = 10),
+        legend.box.background = element_rect(size = 1, color = "black"),
+        legend.position = "right",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+s3
+# setwd("/workdir/users/acv46/stool_PROSeq3/figures/binstats")
+# ggsave(filename = "bin_complete_contam_scatter_v4.pdf", plot = s1,
+#        width = 8, height = 4)
+```
+
+### combine
+```{r}
+require(patchwork)
+sg13 <- g1 / s3
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/binstats")
+ggsave(filename = "bindat_composit_v4.pdf",
+       plot = sg13,
+       width = 7,
+       height = 8)
+ggsave(filename = "bindat_composit_v2.pdf",
+       plot = sg13,
+       width = 6,
+       height = 6)
+ggsave(filename = "bindat_composit_v3.pdf",
+       plot = sg13,
+       width = 3,
+       height = 6)
+```
+
+
+# QC sequencing reads
+
+## read in QC data
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes")
+qccol <- c("sample","rep","type","raw","trimmed","deduplicated")
+qcdat <- read_tsv(file = "QC_log_14Dec2022.txt", col_names = qccol) |>
+  mutate(type = case_when(type == "TEXp" ~ "+TEX",
+                          type == "TEXm" ~ "–TEX",
+                          TRUE ~ type))
+```
+
+## plot QC data
+```{r}
+plotqc <- function(qcdat) {
+  
+  require(tidyverse)
+  
+  qcdat |> 
+    pivot_longer(cols = -c(sample, type, rep), names_to = "step", values_to = "reads") |> 
+    group_by(sample, type, step) |> 
+    summarise(mean = mean(reads)/10^6, sd = sd(reads)/10^6) |> 
+    ungroup() |>
+    mutate(step = factor(step, levels = c("raw","trimmed","deduplicated"))) |>
+    mutate(type = factor(type, levels = c("PROseq","RNAseq","+TEX","–TEX"))) |>
+    ggplot(mapping = aes(x = type, y = mean, fill = step)) +
+    facet_grid(. ~ sample) +
+    geom_bar(stat = "identity", color = "black", 
+             position = position_dodge()) +
+    geom_errorbar(mapping = aes(ymin = mean-sd,
+                                ymax = mean+sd),
+                  width = 0.2,
+                  position = position_dodge(0.9)) +
+    scale_fill_manual(values=c('#e5f5e0','#a1d99b','#31a354')) +
+    theme_classic() +
+    ylab("Millions of Reads") +
+    theme(axis.text.y = element_text(size = 12, color = "black"),
+          axis.text.x = element_text(size = 12, color = "black"),
+          axis.title.y = element_text(size = 12, color = "black"),
+          axis.title.x = element_blank(),
+          legend.box.background = element_rect(size = 1.5, color = "black"),
+          legend.text = element_text(size = 12, color = "black"),
+          legend.title = element_blank(),
+          strip.text = element_text(size = 15, color = "black"),
+          strip.background = element_blank(),
+          strip.placement = "inside",
+          panel.spacing = unit(0.2, "lines"), 
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(size = 1, color = "black", fill = "transparent"),
+          legend.position = "bottom")
+  
+}
+
+p1 <- plotqc(qcdat)
+p1
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/binstats/")
+ggsave(filename = "qcstats_v4.pdf", plot = p1,
+       width = 8, height = 5, units = "in")
+```

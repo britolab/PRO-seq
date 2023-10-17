@@ -1,0 +1,601 @@
+---
+title: "tRNA analysis"
+output: html_notebook
+---
+
+## read in tRNA data
+```{r}
+read_tRNA <- function(gff3, binname) {
+  
+  require(tidyverse)
+  cnames <- c("contig","source","feature","start","end","score","strand","frame","attribute")
+  
+  readr::read_tsv(file = gff3, comment = "#", col_names = cnames) |>
+    dplyr::filter(feature == "tRNA") |>
+    dplyr::mutate(tRNA = stringr::str_match(attribute, "Name=tRNA-\\s*(.*?)\\s*;locus_tag")[,2]) |>
+    dplyr::select(contig, tRNA, start, end, strand) |>
+    dplyr::mutate(bin = binname) |>
+    dplyr::filter(!is.na(tRNA)) |> dplyr::filter(tRNA != "Xxx")
+  
+}
+
+combine_tRNA <- function(path) {
+  
+  bins <- list.files(path)
+  lapply(bins, function(bin) {
+    read_tRNA(gff3 = paste0(path,bin,"/",bin,".gff3"),
+              binname = bin)
+  }) |> dplyr::bind_rows()
+}
+
+US2_tRNA <- combine_tRNA("/workdir/users/acv46/stool_PROSeq3/annotation/US2_bins_bakta/")
+US3_tRNA <- combine_tRNA("/workdir/users/acv46/stool_PROSeq3/annotation/US3_bins_bakta/")
+```
+
+## read in coverage data and subset for tRNA contigs
+```{r}
+subset_cov <- function(name, file, tdat, context, qscore) {
+  
+  setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+  
+  subby <- tdat |>
+    dplyr::select(contig, start, end) |>
+    dplyr::group_by(contig) |>
+    dplyr::summarize(start = min(start), end = max(end)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(length = as.double(stringr::str_match(string = contig,                                                                                                                                                                        pattern = "length_\\s*(.*?)\\s*_cov")[,2])) |>
+    dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+                                                        pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    dplyr::mutate(start = ifelse(start <= context,
+                                 yes = 1,
+                                 no = start - context),
+                  end = ifelse(end + context > length,
+                               yes = end,
+                               no = end + context))
+  
+  big <- readr::read_tsv(file = file,
+                  col_names = TRUE)
+  
+  # Normalization factors (per million mapped nt)
+  PROnorm <- (sum(dplyr::select(big, PRO_plus_full)) + sum(dplyr::select(big, PRO_minus_full))) / 10^9
+  RNAnorm <- (sum(dplyr::select(big, RNA_plus)) + sum(dplyr::select(big, RNA_minus))) / 10^9
+  TEXpnorm <- (sum(dplyr::select(big, TEXp_plus)) + sum(dplyr::select(big, TEXp_minus))) / 10^9
+  TEXmnorm <- (sum(dplyr::select(big, TEXm_plus)) + sum(dplyr::select(big, TEXm_minus))) / 10^9
+  
+  ### Approach 1: SLOW
+  # apply(X = subby, MARGIN = 1, function(x) {
+  #   big |> dplyr::filter(contig == x[1],
+  #                        position %in% x[4]:x[5])
+  #   }
+  # ) |> dplyr::bind_rows()
+  
+  ### Approach 2 : FASTER
+  subby |> tidyr::pivot_longer(cols = c(start, end),
+                               values_to = "position") |>
+    dplyr::select(contig, position) |>
+    dplyr::group_by(contig) |>
+    tidyr::complete(position = seq(from = min(position),
+                                   to = max(position))) |>
+    dplyr::left_join(big) |> ungroup() |>
+    dplyr::mutate(PRO_plus_full = PRO_plus_full / PROnorm,
+                  PRO_minus_full = PRO_minus_full / PROnorm,
+                  PRO_plus_3 = PRO_plus_3 / PROnorm,
+                  PRO_minus_3 = PRO_minus_3 / PROnorm,
+                  PRO_plus_5 = PRO_plus_5 / PROnorm,
+                  PRO_minus_5 = PRO_minus_5 / PROnorm,
+                  RNA_plus = RNA_plus / RNAnorm,
+                  RNA_minus = RNA_minus / RNAnorm,
+                  TEXp_plus = TEXp_plus / TEXpnorm,
+                  TEXp_minus = TEXp_minus / TEXpnorm,
+                  TEXm_plus = TEXm_plus / TEXmnorm,
+                  TEXm_minus = TEXm_minus / TEXmnorm)
+  
+  ### https://stackoverflow.com/q/74437717/7976890
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+US2_cov <- subset_cov("US2", "US2_combined_q30_correct.txt", US2_tRNA, 100, 30)
+US3_cov <- subset_cov("US3", "US3_combined_q30_correct.txt", US3_tRNA, 100, 30)
+```
+
+## read in bin data
+```{r}
+# read the BINSTATS file made with the clean_assemble_bin.sh pipeline
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE)
+```
+
+## plot coverage across tRNA arrays
+```{r}
+plot_tRNA <- function(lab, covdat, pdat, bindat, gap, context, qscore, mincov) {
+  
+  # lab = sample label used for output filename string
+  # covdat = coverage data, made in chunk above
+  # tdat = tRNA data, made in chunk above
+  # bindat = bin data
+  # gap = maximum allowable nt between consecutive tRNAs to be grouped together
+  # context = nt around tRNA(s) to plot (can't be greater than context used for covdat object)
+  # qscore = qscore used to filter mapping values used to create coverage file
+  # mincov = minimum normalized maximum coverage in any library to plot array
+  
+  require(tidyverse)
+  require(stringr)
+  require(staplr)
+
+  # get unique contigs
+  
+  contig_list <- tdat |> 
+    dplyr::select(contig) |>
+    purrr::as_vector() |> unique()
+  
+  # iterate through contig list
+  sapply(contig_list, function(xcon) {
+    
+    # get shortened contig name as it appears in covdat
+    con <- stringr::str_match(string = xcon,
+                              pattern = "NODE_\\s*(.*?)\\s*_length")[2]
+    len <- as.numeric(stringr::str_match(string = xcon,
+                                         pattern = "length_\\s*(.*?)\\s*_cov")[2])
+    tbin <- tdat |> dplyr::filter(contig == xcon) |>
+      dplyr::select(bin) |> dplyr::slice(1) |> as.character()
+    spec <- bindat |> dplyr::filter(bin == tbin) |>
+      dplyr::select(species) |> as.character()
+    
+    if (is.na(spec)) {
+      spec <- "[no species]"
+    }
+    
+    # group tRNAs by proximity (closer than "gap")
+    arr <- tdat |> dplyr::filter(contig == xcon) |>
+      dplyr::arrange(start) |>
+      dplyr::mutate(diff = tidyr::replace_na(start - dplyr::lag(end), 0)) |>
+      dplyr::mutate(brk = ifelse(diff >= gap, 1, 0)) |>
+      dplyr::mutate(grp = cumsum(brk) + 1) |>
+      dplyr::select(contig, tRNA, start, end, strand, grp)
+
+    array_list <- arr |> dplyr::select(grp) |>
+      purrr::as_vector() |> unique()
+    
+    # iterate through per-contig array list
+    sapply(array_list, function(xarr) {
+      
+      arrsub <- arr |> dplyr::filter(grp == xarr) |>
+        dplyr::mutate(tlen = end - start)
+      tcount <- nrow(arrsub)
+      scount <- dplyr::select(arrsub, strand) |> unique() |> nrow()
+      
+      # only process arrays where all tRNAs on the same strand
+      if (tcount >= 1 && scount == 1) {
+      
+        xmin <- arrsub |> dplyr::select(start) |> min() - context
+        if (xmin < 1) {
+          xmin <- 1
+        }
+        
+        xmax <- arrsub |> dplyr::select(end) |> max() + context
+        if (xmax > len) {
+          xmax <- len
+        }
+        
+        cov <- covdat |> dplyr::filter(contig == con) |>
+          dplyr::filter(position %in% xmin:xmax) |>
+          tidyr::pivot_longer(cols = -c(contig,position),
+                              names_to = "lib",
+                              values_to = "value") |>
+          dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib), # flipped!!!
+                                       yes = -1 * as.numeric(value),
+                                       no = as.numeric(value))) |>
+          dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                        yes = "minus",
+                                        no = "plus")) |>
+          dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!!!
+                                                grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!!!
+                                                grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                                grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                                grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                                grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+"))
+             
+        str <- arrsub |> dplyr::select(strand) |> purrr::as_vector() |> unique()
+        
+        message(paste0("sample: ", lab,
+                       ", contig: ", xcon,
+                       ", array group: ", xarr,
+                       ", tRNA count: ", tcount))
+        
+        ymax <- cov |> select(value) |> abs() |> max()
+        
+        # only process arrays with min coverage
+        if (ymax >= mincov) {
+          
+          if (length(str) == 1 && str == "+") {
+            textpos <- -1
+            arrows <- data.frame(x = arrsub$start + (arrsub$tlen / 10),
+                                 xend = arrsub$end - (arrsub$tlen / 10),
+                                 y = -ymax * 0.28)
+          } else if (length(str) == 1 && str == "-") {
+            textpos <- 1
+            arrows <- data.frame(x = arrsub$end - (arrsub$tlen / 10),
+                                 xend = arrsub$start + (arrsub$tlen / 10),
+                                 y = ymax * 0.28)
+          }
+          
+          breaks <- seq(from = xmin,
+                        to = xmax,
+                        by = round((xmax - xmin)/6, digits = 0))
+               
+          boxes <- data.frame(x1 = arrsub$start,
+                              x2 = arrsub$end,
+                              y1 = -ymax * 0.2,
+                              y2 = ymax * 0.2,
+                              stringsAsFactors = F,
+                              text = arrsub$tRNA)
+               
+          pc <- ggplot(data = cov) +
+            geom_area(mapping = aes(x = position, y = value, linetype = strand),
+                      color = "#ff0000",
+                      fill = "#ff0000") +
+                      facet_grid(factor(type) ~ .) +
+            geom_text(mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                                    y = ymax * 0.8,
+                                    label = type),
+                      hjust = 0,
+                      size = 3.5,
+                      check_overlap = TRUE) +
+            geom_rect(data = boxes,
+                      mapping = aes(xmin = x1, xmax = x2, ymin = y1, ymax = y2),
+                      fill = "black",
+                      alpha = 0.2,
+                      inherit.aes = FALSE) +
+            geom_text(data = boxes,
+                      mapping = aes(x = x1 + ((x2 - x1) / 2),
+                                    label = text),
+                      y = 0.45 * ymax * textpos,
+                      inherit.aes = FALSE) +
+            geom_segment(data = arrows,
+                         mapping = aes(x = x, xend = xend, y = y, yend = y),
+                         lineend = "butt", linejoin = "round",
+                         linewidth = 0.5, arrow = arrow(length = unit(0.05, "npc"))) +
+            scale_x_continuous(breaks = breaks,
+                               labels = sprintf("%.2f", (breaks / 1000))) +
+            coord_cartesian(xlim = c(xmin, xmax),
+                            ylim = c(-ymax - (0.05 * ymax), ymax + (0.05 * ymax))) +
+            scale_linetype_manual(values = c(1,1)) +
+            theme_bw() +
+            ggtitle(paste0(lab, ": ", spec, " (", xcon,")")) +
+            geom_hline(yintercept = 0, color = "black") +
+            ylab("Depth per base per billion mapped nt") +
+            xlab("Position on contig (kbp)") +
+            theme(axis.title.x = element_text(size = 10),
+                  axis.title.y = element_text(size = 10),
+                  axis.text = element_text(color = "black", size = 10),
+                  title = element_text(size = 8),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  strip.background = element_blank(),
+                  strip.text = element_blank(),
+                  legend.position = "none")
+          
+          # save each plot as a pdf
+          fname <- paste(lab, paste0("contig",con),
+                         paste0("group",xarr), "partial.pdf", sep = "_")
+          ggsave(filename = fname,
+                 plot = pc,
+                 device = cairo_pdf,
+                 dpi = 600,
+                 width = 6,
+                 height = 8)
+          
+        } # end coverage if statement
+      } # end codirectionality if statement   
+    }) # inner sapply statement
+  }) # end outer sapply statment
+  
+  # create ordered pdf list by number of RNA-seq reads
+  pdflist <- list.files(path = ".", pattern = paste(lab))
+  # combine pdfs into a single file
+  staplr::staple_pdf(input_files = pdflist,
+                     output_filepath = file.path(".", paste0(lab, "_tRNA_merged_q", qscore, "_context", context, "_min", mincov, ".pdf", sep = "")))
+  # remove individual pdfs
+  do.call(file.remove, list(pdflist))
+  
+}
+```
+
+### test plotting function on subset of contigs
+```{r}
+# testing
+plot_tRNA("US2", US2_cov, US2_tRNA |>
+            filter(contig %in% c("NODE_160_length_94574_cov_38.721061",
+                                 "NODE_11305_length_2006_cov_9.419272")),
+          US2_bins, 1000, 100, 30)
+```
+
+### run plotting function on all bins
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/tRNA/")
+plot_tRNA("US2", US2_cov, US2_tRNA, US2_bins, 1000, 100, 30, 50)
+plot_tRNA("US3", US3_cov, US3_tRNA, US3_bins, 1000, 100, 30, 50)
+```
+
+
+
+
+## call 5' PRO-seq peaks in tRNAs
+```{r}
+# To do
+## fix bind_rows call to get both minus and plus strand results
+## incorporate GTF data for genetic context annotation of pause sites
+## parallelize apply calls
+## rewrite to use single apply call over bin-contig pair instead of two apply calls, for better pbapply reporting
+
+# from Sun 2021 -- "ends of all uniquely mapped RNA reads (bottom lane) were determined and the read count for each 3′ end position was calculated and plotted (top lane). The genomic positions where 3’ end/3’ end median (51-bp window) read counts ratio (pause score) was ≥ 20 and read counts/10^6 reads was ≥ 10 satisfied our stringent definition for a pause site."
+
+# main function to process each contig in the chosen bin set
+get_motifs <- function(covdat, bindat, seqdat, gtf, end, range, mincov, minpause, context, method) {
+  
+  # INPUTS
+  ## covdat is coverage data
+  ## bindat is all metadata
+  ## seqdat is genomic ranges object containing all sequence data
+  ## gtf is a gtf annotation file
+  ## end is either 3 or 5
+  ## range is the context around a position to use in pause score calculation
+  ## mincov is the minimum raw coverage value at a position to determine whether a pause score should be calculated
+  ## minpause is the the minimum Z score for a position to call it as significantly paused
+  ## context is the number of bases surrounding a significant peak
+  
+  require(tidyverse)
+  require(stats)
+  require(Biostrings)
+  require(pbapply)
+  
+  # helper function to get pause site z score
+  pause_score <- function(row, full, range, con_len, method){
+    
+    pos <- row[2] %>% as.numeric()
+  
+    # this code works with both circular and linear sequences
+    fullrange <- sort(c(
+      c(((pos - 1) - c(1:range)) %% con_len + 1),
+      c(((pos - 1) + c(1:range)) %% con_len + 1)
+      ))
+    
+    if (method == "mean") {
+    
+      mean <- full %>%
+        filter(position %in% fullrange) %>%
+        select(value) %>% abs() %>% 
+        unlist() %>% mean()
+    
+      std <- full %>%
+        filter(position %in% fullrange) %>%
+        select(value) %>% abs() %>% 
+        unlist() %>% sd()
+    
+      # calculate z score for pause sites passing raw cov threshold
+      zscore <- (abs(as.numeric(row[4])) - mean) / std
+    
+      list(zscore, as.numeric(row[2]))
+    
+    } else if (method == "mad") {
+  
+      mean <- full %>%
+        filter(position %in% fullrange) %>%
+        select(value) %>% abs() %>% 
+        unlist() %>% mean()
+    
+      mad <- full %>%
+        filter(position %in% fullrange) %>%
+        select(value) %>% abs() %>% 
+        unlist() %>% mad()
+    
+      # calculate z score for pause sites passing raw cov threshold
+      zscore <- (abs(as.numeric(row[4])) - mean) / mad
+    
+      list(zscore, as.numeric(row[2]))
+      
+    }
+      
+  }
+  
+  # for each bin, apply function to constituent contigs
+  pblapply(bindat %>% select(bin) %>% unique() %>% unlist(),
+         function(i) {
+           pblapply(bindat %>% filter(bin == i) %>% select(contig) %>% unlist(),
+                  function(j) {
+                    
+                    message(paste0("\n","Procesing bin ", i, ", contig ", j))
+                    
+                    # subset coverage data by contig and sequence end type
+                    con_cov <- covdat %>%
+                      filter(contig == j & end == end)
+                    
+                    con_len <- max(con_cov$position) 
+                    index <- c((range + 1):(con_len - range - 1))
+                    
+                    # create separate datasets for plus and minus positions
+                    # filter for minimum absolute 
+                    # plus_set <- con_cov %>%
+                    #   filter(strand == "plus" & abs(value) >= mincov & position %in% index)
+                    
+                    minus_set <- con_cov %>%
+                      filter(strand == "minus" & abs(value) >= mincov & position %in% index)
+                    
+                    cseq <- seqdat[j][[1]]
+                    
+                    # get strand-wise z scores for peaks passing raw coverage threshold
+                    # eliminate peaks with overlapping ranges by only keeping larger peak
+                    ## this is needed to prevent the same sequence from being pulled more than once
+                    
+                    # plus strand
+                    if (nrow(plus_set) > 0) {
+
+                      plus_z <- tibble(z = rep(NA, nrow(plus_set)),
+                                       position = rep(NA, nrow(plus_set)))
+                      hold <- apply(X = plus_set,
+                                    MARGIN = 1,
+                                    FUN = pause_score,
+                                    full = con_cov %>% filter(strand == "plus"),
+                                    range = range,
+                                    con_len = con_len,
+                                    method = method)
+
+                      plus_z$z <- do.call(rbind, hold)[,1] %>% unlist()
+                      plus_z$position <- do.call(rbind, hold)[,2] %>% unlist()
+                      plus_z <- plus_z %>%
+                        mutate(startrng = position - context) %>%
+                        mutate(endrng = position + context) %>%
+                        arrange(startrng) %>%
+                        filter(z >= minpause)
+
+                      message(paste0("\n","--> plus strand has ", nrow(plus_z), " hits over Z-score threshold"))
+
+                      plus_z$grp <- 1
+                      if (nrow(plus_z) > 1) {
+                        for (k in 2:nrow(plus_z)) {
+
+                          if (plus_z$endrng[k - 1] >= plus_z$startrng[k]) {
+
+                            plus_z$grp[k] <- plus_z$grp[k - 1]
+
+                          } else {
+
+                            plus_z$grp[k] <- plus_z$grp[k - 1] + 1
+
+                          }
+                        }
+                      }
+
+                      message(paste0("\n","----> plus strand has ", nrow(plus_z), " hits remaining after overlap removal"))
+
+                      if (nrow(plus_z) > 0) {
+                        plus_z <- plus_z %>%
+                          group_by(grp) %>%
+                          top_n(1, z) %>%
+                          ungroup() %>%
+                          mutate(bin = i) %>%
+                          mutate(contig = j) %>%
+                          mutate(strand = "plus")
+                          plus_z$sequence <- apply(X = plus_z, MARGIN = 1,
+                                                   FUN = function(x) {
+                                                     cseq[x[3]:x[4]] %>%
+                                                       as.character()
+                                                     }
+                                                   )
+
+                        plus_z
+
+                      }
+
+                    } %>% bind_rows()
+                    
+                    # minus strand
+                    if (nrow(minus_set) > 0) {
+
+                      minus_z <- tibble(z = rep(NA, nrow(minus_set)),
+                                        position = rep(NA, nrow(minus_set)))
+                      hold <- apply(X = minus_set,
+                                    MARGIN = 1,
+                                    FUN = pause_score,
+                                    full = con_cov %>% filter(strand == "minus"),
+                                    range = range,
+                                    con_len = con_len,
+                                    method = method)
+
+                      minus_z$z <- do.call(rbind, hold)[,1] %>% unlist()
+                      minus_z$position <- do.call(rbind, hold)[,2] %>% unlist()
+                      minus_z <- minus_z %>%
+                        mutate(startrng = position - context) %>%
+                        mutate(endrng = position + context) %>%
+                        arrange(startrng) %>%
+                        filter(z >= minpause)
+
+                      message(paste0("\n","--> minus strand has ", nrow(minus_z), " hits over Z-score threshold"))
+
+                      minus_z$grp <- 1
+                      if (nrow(minus_z) > 1) {
+                        for (k in 2:nrow(minus_z)) {
+
+                          if (minus_z$endrng[k - 1] >= minus_z$startrng[k]) {
+
+                            minus_z$grp[k] <- minus_z$grp[k - 1]
+
+                          } else {
+
+                            minus_z$grp[k] <- minus_z$grp[k - 1] + 1
+
+                          }
+                        }
+                      }
+
+                      message(paste0("\n","----> minus strand has ", nrow(minus_z), " hits remaining after overlap removal"))
+
+                      if (nrow(minus_z) > 0) {
+                        minus_z <- minus_z %>%
+                          group_by(grp) %>%
+                          top_n(1, z) %>%
+                          ungroup() %>%
+                          mutate(bin = i) %>%
+                          mutate(contig = j) %>%
+                          mutate(strand = "minus")
+                          minus_z$sequence <- apply(X = minus_z, MARGIN = 1,
+                                                   FUN = function(x) {
+                                                     cseq[x[3]:x[4]] %>%
+                                                       reverseComplement() %>%
+                                                       as.character()
+                                                     }
+                                                   )
+
+                        minus_z
+
+                      }
+
+                    } %>% bind_rows()
+                    
+                }) %>% bind_rows()
+       
+        }) %>% bind_rows()
+  
+  
+}
+
+```
+
+### run get_motifs
+```{r}
+# testset <- US2_bindat %>% 
+#   filter(bin %in% c("10_sub","13_sub")) %>%
+#   group_by(bin) %>% 
+#   filter(row_number() <= 10) %>% ungroup()
+
+US2_results <- get_motifs(covdat = US2_cov_pro,
+                          bindat = US2_bindat,
+                          seqdat = US2_fasta,
+                          gtf = NULL,
+                          end = 3,
+                          range = 25,
+                          mincov = 10,
+                          minpause = 5,
+                          context = 20,
+                          method = "mad")
+write_csv(x = US2_results,
+          file = "motifs/US2_peaks3_25r_10c_5z_20s_minus_mad.csv",
+          col_names = T)
+
+US3_results <- get_motifs(covdat = US3_cov_pro,
+                          bindat = US3_bindat,
+                          seqdat = US3_fasta,
+                          gtf = NULL,
+                          end = 3,
+                          range = 25,
+                          mincov = 10,
+                          minpause = 5,
+                          context = 20,
+                          method = "mad")
+write_csv(x = US3_results,
+          file = "motifs/US3_peaks3_25r_10c_5z_20s_minus_mad.csv",
+          col_names = T)
+```
+

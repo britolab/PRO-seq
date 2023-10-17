@@ -1,0 +1,532 @@
+---
+title: "dRNA-seq vs PRO-seq"
+output: html_notebook
+---
+
+# compare tssar peaks overlapping TSSs
+
+## load libraries
+```{r}
+library(tidyverse)
+```
+
+## read in binstats data
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE, show_col_types = FALSE)
+
+# merged_bins <- bind_rows(
+#   US2_bins |> mutate(sample = "US2"),
+#   US3_bins |> mutate(sample = "US3")
+# )
+```
+
+## read in scaffold2bin mapping
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly")
+get_map <- function(data) {
+  read_tsv(file = data,
+           col_names = c("contig","bin"), show_col_types = FALSE)
+}
+
+US2_scaff2bins <- get_map("US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt")
+US3_scaff2bins <- get_map("US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt")
+```
+
+## merge bindat and contig mappings
+```{r}
+merge_all <- function(bins, scaff2bins) {
+  left_join(scaff2bins, bins, by = "bin") |>
+     mutate(contig = str_remove(pattern = "NODE_",
+                                string = str_remove(pattern = "_length.*",
+                                                    string = contig)))
+}
+
+US2_merged <- merge_all(US2_bins, US2_scaff2bins)
+US3_merged <- merge_all(US3_bins, US3_scaff2bins)
+rm(US2_bins, US3_bins, US2_scaff2bins, US3_scaff2bins)
+```
+
+## read in bakta annotationsd
+```{r}
+read_gff3 <- function(gff3) {
+  
+  require(tidyverse)
+  cnames <- c("contig","source","feature","start","end","score","strand","frame","attribute")
+  
+  readr::read_tsv(file = gff3, comment = "#", col_names = cnames) |>
+    #dplyr::filter(contig %in% unique(idat$contig)) |> 
+    dplyr::filter(feature == "CDS") |>
+    dplyr::mutate(product = stringr::str_match(attribute, "Name=\\s*(.*?)\\s*;locus_tag")[,2]) |>
+    dplyr::select(contig, start, end, strand, product) |>
+    dplyr::mutate(clen = as.double(stringr::str_match(string = contig,
+                                                      pattern = "length_\\s*(.*?)\\s*_cov")[,2]))
+    
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation/")
+US2_genes <- read_gff3("US2_allbins_bakta1.7.gff3")
+US3_genes <- read_gff3("US3_allbins_bakta1.7.gff3")
+```
+
+## assign operons as colinear genes with no more than 30 nt between start and end
+```{r}
+get_ops <- function(genes, maxspace) {
+ 
+  # function to assign close, colinear genes to same group
+  op <- function(x) {
+    for (i in 2:nrow(x)) {
+       x[i,7] <- ifelse(test = x[i,1] == x[i-1,1] &
+                               x[i,4] == x[i-1,4] &
+                               x[i,2] - x[i-1,3] <= maxspace,
+                        yes = x[i-1,7],
+                        no  = x[i-1,7] + 1) 
+    } 
+    x
+  }
+  
+  require(tidyverse)
+  data <- genes |>
+    group_by(contig, strand) |>
+    arrange(start, .by_group = TRUE) |>
+    ungroup() |>
+    mutate(opgroup = 1)
+  
+  # collapse operons to single row
+  group_by(op(data), opgroup) |>
+    mutate(opstart = first(start), opend = last(end)) |> 
+    ungroup() |>
+    select(contig, strand, clen, opstart, opend) |> distinct() |>
+    rename(start = opstart, end = opend)
+
+}
+
+US2_ops <- get_ops(US2_genes, 30)
+US3_ops <- get_ops(US3_genes, 30)
+```
+
+
+## read in tssar bed peaks
+```{r}
+read_tss <- function(tssdat, scaff2bin) {
+  read_tsv(file = tssdat,
+           col_names = c("contig","start","end","id","score","strand"))
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3")
+US2_TEX_tss <- read_tss("transcriptomes/tssar/US2_TEX/US2_TSS_100000nt_1000reads.bed")
+US3_TEX_tss <- read_tss("transcriptomes/tssar/US3_TEX/US3_TSS_100000nt_1000reads.bed")
+US2_PRO_tss <- read_tss("transcriptomes/tssar/US2_PRO/US2_TSS_100000nt_1000reads.bed")
+US3_PRO_tss <- read_tss("transcriptomes/tssar/US3_PRO/US3_TSS_100000nt_1000reads.bed")
+```
+
+## get list of filtered contigs
+```{r}
+get_contigs <- function(list1,list2) {
+  
+  require(tidyverse)
+  full_join(
+    read_tsv(file = list1, col_names = "contig"),
+    read_tsv(file = list2, col_names = "contig")
+  )
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/tssar")
+US2_contigs <- get_contigs("US2_PRO/US2_contigs_100000nt_1000reads_contigs.txt",
+                           "US2_TEX/US2_contigs_100000nt_1000reads_contigs.txt")
+US3_contigs <- get_contigs("US3_PRO/US3_contigs_100000nt_1000reads_contigs.txt",
+                           "US3_TEX/US3_contigs_100000nt_1000reads_contigs.txt")
+```
+
+
+## intersection with promoters
+```{r}
+# see tss_peaks.R
+# run as background job, memory-intensive
+
+tsspeaks <- function(pro, tex, genes, range) {
+  
+  require(tidyverse)
+  
+  genecount <- nrow(genes)
+  
+  lapply(1:genecount, function(x) {
+    
+    if (x %% 100 == 0) {
+      message(paste0(x,"/",genecount))
+    }
+    
+    gene <- genes[x,]
+    contig_ <- gene[[1]]
+    strand_ <- gene[[4]]
+    product_ <- gene[[5]]
+    clen_ <- gene[[6]]
+    if (strand_ == "+") {
+      center_ <- as.numeric(gene[[2]])
+    } else {
+      center_ <- as.numeric(gene[[3]])
+    }
+
+    left_  <- center_ - range
+    if (left_ < 1) {
+      left_ <- 1
+    }
+    right_ <- center_ + range
+    if (right_ > clen_) {
+      right_ <- clen_
+    }
+    
+    promoter_ <- c(left_:right_)
+    
+    pcount_ <- nrow(
+      pro |> dplyr::filter(contig == contig_,
+                           strand == strand_,
+                           start %in% promoter_)
+    )
+    
+    tcount_ <- nrow(
+      tex |> dplyr::filter(contig == contig_,
+                           strand == strand_,
+                           start %in% promoter_)
+    )
+    
+    c(contig = contig_, product = product_, strand = strand_,
+      pcount = pcount_, tcount = tcount_)
+    
+  }) |> dplyr::bind_rows()
+  
+}
+
+US2_peaks <- tsspeaks(US2_PRO_tss, US2_TEX_tss, US2_genes |> dplyr::slice(1:10), 50)
+```
+
+## Euler diagrams
+```{r}
+# library(eulerr)
+
+draw_euler <- function(prodat, texdat, peakdat, genes, contigs) {
+  
+  require(tidyverse)
+  require(eulerr)
+  
+  ngenes <- nrow(filter(genes, contig %in% as_vector(contigs)))
+  
+  np  <- nrow(prodat)
+  nd  <- nrow(texdat)
+  ngp <- sum(as.numeric(peakdat$pcount))
+  ngd <- sum(as.numeric(peakdat$tcount))
+  ngdp <- nrow(filter(peakdat, pcount > 0, tcount > 0))
+  
+  plot(euler(combinations = c("promoters" = ngenes,
+                              "PRO-seq" = np,
+                              "dRNA-seq" = nd,
+                              "PRO-seq&promoters" = ngp,
+                              "dRNA-seq&promoters" = ngd,
+                              "PRO-seq&dRNA-seq&promoters" = ngdp),
+             shape = "ellipse"),
+       quantities = TRUE)
+  
+}
+
+draw_euler(US2_PRO_tss, US2_TEX_tss, US2_peaks, US2_genes, US2_contigs)
+draw_euler(US3_PRO_tss, US3_TEX_tss, US3_peaks, US3_genes, US3_contigs)
+
+draw_euler(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp, US2_genes, US2_contigs)
+draw_euler(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp, US3_genes, US3_contigs)
+
+draw_euler(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp_opp, US2_genes, US2_contigs)
+draw_euler(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp_opp, US3_genes, US3_contigs)
+
+draw_euler(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp_opp_opp, US2_genes, US2_contigs)
+draw_euler(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp_opp_opp, US3_genes, US3_contigs)
+```
+
+## upset plots
+```{r}
+# library(UpSetR)
+
+draw_upset <- function(prodat, texdat, peakdat, genes, contigs) {
+  
+  require(tidyverse)
+  require(eulerr)
+  
+  ngenes <- nrow(filter(genes, contig %in% as_vector(contigs)))
+  
+  np  <- nrow(prodat)
+  nd  <- nrow(texdat)
+  ngp <- sum(as.numeric(peakdat$pcount))
+  ngd <- sum(as.numeric(peakdat$tcount))
+  ngdp <- nrow(filter(peakdat, pcount > 0, tcount > 0))
+  
+  dat <- c("promoters" = ngenes,
+           "PROseq" = np,
+           "dRNAseq" = nd,
+           "PROseq&promoters" = ngp,
+           "dRNAseq&promoters" = ngd,
+           "PROseq&dRNAseq&promoters" = ngdp)
+  
+  upset(data = fromExpression(dat), 
+        sets.bar.color = "#56B4E9",
+        order.by = "degree",
+        nintersects = 3)
+  
+}
+
+draw_upset(US2_PRO_tss, US2_TEX_tss, US2_peaks, US2_genes, US2_contigs)
+draw_upset(US3_PRO_tss, US3_TEX_tss, US3_peaks, US3_genes, US3_contigs)
+
+draw_upset(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp, US2_genes, US2_contigs)
+draw_upset(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp, US3_genes, US3_contigs)
+
+draw_upset(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp_opp, US2_genes, US2_contigs)
+draw_upset(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp_opp, US3_genes, US3_contigs)
+
+draw_upset(US2_PRO_tss, US2_TEX_tss, US2_peaks_opp_opp_opp, US2_genes, US2_contigs)
+draw_upset(US3_PRO_tss, US3_TEX_tss, US3_peaks_opp_opp_opp, US3_genes, US3_contigs)
+```
+
+
+
+# use bedtools profiles to make metaplots
+## read in binstats data and annotations using code above
+## subset contigs based on bin completeness and length
+```{r}
+require(tidyverse)
+
+US2_HQbins <- filter(US2_merged, completeness > 90, contamination < 5)
+US3_HQbins <- filter(US3_merged, completeness > 90, contamination < 5)
+```
+
+## get colsums for normalization, combine reps, normalize, and writeout
+```{r}
+# run as background jobs!
+# see combine_reps_and_normalize.R
+# see scripts/combine_reps_and_normalize_US2.R
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes")
+
+read_cov <- function(file_) {
+
+  require(tidyverse)
+  base_ <- read_tsv(file = file_, col_names = TRUE)
+  PRO_sum  <- sum(base_[,grepl("PRO", names(base_))])
+  TEXp_sum <- sum(base_[,grepl("TEXp", names(base_))])
+  TEXm_sum <- sum(base_[,grepl("TEXm", names(base_))])
+  
+  base_ |>
+    mutate(PRO_f = (PRO_A_f + PRO_B_f + PRO_C_f) / PRO_sum,
+           PRO_r = (PRO_A_r + PRO_B_r + PRO_C_r) / PRO_sum,
+           TEXp_f = (TEXp_A_f + TEXp_B_f + TEXp_C_f) / TEXp_sum,
+           TEXp_r = (TEXp_A_r + TEXp_B_r + TEXp_C_r) / TEXp_sum,
+           TEXm_f = (TEXm_A_f + TEXm_B_f + TEXm_C_f) / TEXm_sum,
+           TEXm_r = (TEXm_A_r + TEXm_B_r + TEXm_C_r) / TEXm_sum) |>
+    select(contig, position, PRO_f, PRO_r,
+           TEXp_f, TEXp_r, TEXm_f, TEXm_r) |>
+    pivot_longer(cols = -c("contig","position"), names_to = "lib", values_to = "value") |>
+    separate(col = lib, into = c("type","strand"), sep = "_") |>
+    mutate(strand = ifelse(strand == "f", "+", "-"))
+  
+}
+
+write_tsv(x = read_cov(file_ = "US2/coverage/US2_combined_depth.txt"),
+          file = "US2/coverage/US2_combined_depth_normalized.txt",
+          col_names = TRUE)
+```
+
+### merge chunks and save as single file
+```{r}
+# slow, just cat and remove extra headers
+# cat US2_combined_depth_chunk{01..10}.txt | grep -v "contig" > US2__combined_depth_normalized.txt
+# rm ./*chunk*.txt
+
+merge_chunks <- function(dir, out) {
+  
+  require(tidyverse)
+  lapply(X = list.files(dir, pattern = "chunk"),
+         FUN = function(f) {
+           message(paste("processing",f))
+           read_csv(file = paste0(dir,f),
+                    col_names = TRUE)
+         }) |>
+    bind_cols() |> write_csv(file = paste0(dir,out))
+}
+
+merge_chunks("/workdir/users/acv46/stool_PROSeq3/transcriptomes/US2/coverage/", "US2_combined_depth_normalized.txt")
+```
+
+## pick a bin, get the contigs, read in and merge coverage data
+```{r}
+get_cov <- function(file_, bindat_, bin_, genedat_, genelen_, upstream_, sample_) {
+  
+  # file_ = combined genomecov output
+  # bindat_ = "merged" object from above
+  # bin_ = bin of interest
+  # genedat_ = "genes" object from above
+  # genelen_ = minimum gene length for inclusion
+  ## also the value for the right bound of the gene body metaplot range
+  # upstream_ = context upstream of gene start
+  
+  clist <- filter(bindat_, bin == bin_) |>
+    select(contig) |> as_vector() |> as.numeric() |> unique()
+  
+  spec_ <- filter(bindat_, bin == bin_) |>
+    select(species) |> as_vector() |> unique()
+  
+  genes <- mutate(genedat_,
+                  contig = as.numeric(str_match(contig, "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    filter(contig %in% clist,
+           end - start >= genelen_) |>
+    apply(MARGIN = 1, FUN = function(i) {
+      
+      if (i[4] == "+") {
+        start_ <- as.numeric(i[2]) - upstream_
+        end_ <- as.numeric(i[2]) + genelen_
+      } else if (i[4] == "-") {
+        start_ <- as.numeric(i[3]) - genelen_
+        end_ <- as.numeric(i[3]) + upstream_
+      }
+      if (start_ < 1) {
+        start_ <- 1
+      }
+      if (end_ > as.numeric(i[6])) {
+        end_ <- as.numeric(i[6])
+      }
+      width_ <- (end_ - start_)
+      # flip these, for some reason
+      if (i[4] == "-") {
+        index_ <- c((-upstream_):(width_ - upstream_))
+      } else if (i[4] == "+") {
+        index_ <- c((width_ - upstream_):(-upstream_))
+      }
+      
+      tibble(contig = as.numeric(i[1]),
+             genestrand = i[4],
+             product = i[5],
+             position = start_:end_,
+             index = index_)
+      
+      }) |> bind_rows()
+    
+  # code to read non-normalized data
+  
+  # read_tsv(file = file_, col_names = TRUE) |>
+  #   filter(contig %in% clist) |>
+  #   mutate_at(vars(-c("contig","position")), function(x){(x/sum(x))*1e+09}) |>
+  #   pivot_longer(cols = -c("contig","position"), names_to = "lib", values_to = "value") |>
+  #   right_join(genes, by = c("contig", "position")) |>
+  #   separate(col = lib, into = c("type","rep","libstrand"), sep = "_") |>
+  #   mutate(libstrand = ifelse(libstrand == "f", "+", "-")) |>
+  #   mutate(typerep = paste0(type, "-", rep)) |>
+  #   select(-c(product,type,rep)) |>
+  #   filter(genestrand == libstrand)
+  
+  # code to read normalized data
+  
+  dat_ <- read_tsv(file = file_,
+           col_names = c("contig","position","type","strand","value")) |>
+    filter(contig %in% clist) |>
+    right_join(genes, by = c("contig", "position")) |>
+    filter(genestrand == strand)
+  
+  ngenes_ <- nrow(filter(genes, index == 0))
+  
+  label_ <- paste0(sample_,"\n",
+                   "bin ", bin_,"\n",
+                   spec_,"\n",
+                   ngenes_, " genes > ", genelen_, " bp")
+
+  ggplot(data = dat_) +
+    geom_smooth(mapping = aes(x = index, y = value, color = type),
+                formula = y ~ s(x, bs = "cs"),
+                method = "gam") +
+    scale_x_continuous(labels = seq(-upstream_, genelen_, 100),
+                       breaks = seq(-upstream_, genelen_, 100)) +
+    theme_classic() +
+    xlab("gene position") +
+    ylab("depth per 1e9 mapped nt") +
+    theme(axis.text = element_text(size = 8, color = "black"),
+          axis.title = element_text(size = 12, color = "black")) +
+    annotate(geom = "text", x = 750, y = Inf,
+             vjust = 1, hjust = 0, label = label_)
+  
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes")
+US2_bin77 <- get_cov(file_ = "US2/coverage/US2_combined_depth_normalized.txt",
+                     bindat_ = US2_merged,
+                     bin_ = unique(US2_HQbins$bin)[1],
+                     genedat_ = US2_genes,
+                     genelen_ = 1000,
+                     upstream_ = 50,
+                     sample_ = "US2")
+US2_bin77
+```
+
+## test plot geom_smooth
+```{r}
+
+label_ <- paste0("test sample","\n",
+                 "test bin","\n",
+                 "test genes")
+
+ggplot(data = US2_bin77) +
+  geom_smooth(mapping = aes(x = index, y = value, color = type),
+              formula = y ~ s(x, bs = "cs"),
+              method = "gam") +
+  theme_classic() +
+  xlab("gene position") +
+  ylab("depth per 1e9 mapped nt") +
+  theme(axis.text = element_text(size = 5, color = "black"),
+        axis.title = element_text(size = 8, color = "black")) +
+  annotate(geom = "text", x = 750, y = Inf, vjust = 1, label = label_)
+
+# ggplot(data = US2_bin77) +
+#   geom_smooth(mapping = aes(x = index, y = value, color = type),
+#               method = "lm") +
+#   theme_classic() +
+#   xlab("gene position") +
+#   ylab("depth per 1e9 mapped nt") +
+#   theme(axis.text = element_text(size = 5, color = "black"),
+#         axis.title = element_text(size = 8, color = "black")) +
+#   annotate(geom = "text", x = 750, y = Inf, vjust = 1, label = label_)
+
+ggplot(data = US2_bin77) +
+  geom_smooth(mapping = aes(x = index, y = value, color = type),
+              method = "glm") +
+  theme_classic() +
+  xlab("gene position") +
+  ylab("depth per 1e9 mapped nt") +
+  theme(axis.text = element_text(size = 5, color = "black"),
+        axis.title = element_text(size = 8, color = "black")) +
+  annotate(geom = "text", x = 750, y = Inf, vjust = 1, label = label_)
+
+ggplot(data = US2_bin77) +
+  geom_smooth(mapping = aes(x = index, y = value, color = type),
+              method = "loess") +
+  theme_classic() +
+  xlab("gene position") +
+  ylab("depth per 1e9 mapped nt") +
+  theme(axis.text = element_text(size = 5, color = "black"),
+        axis.title = element_text(size = 8, color = "black")) +
+  annotate(geom = "text", x = 750, y = Inf, vjust = 1, label = label_)
+
+```
+
+## call operons in HQ bins with poem
+```{bash}
+cd /home/acv46
+git clone https://github.com/Rinoahu/POEM_py3k
+source mambaforge/bin/activate 
+mamba create -n poem python=3
+conda activate poem
+# prokka=1.12 leads to segfault
+# keras=2.2.4 is uninstallable due to conflicts
+# perl=5.22 is uninstallable due to conflicts
+mamba install -y -c bioconda diamond prokka idba cd-hit keras networkx biopython numpy art
+mamba install -y -c biobuilds perl
+cd POEM_py3k/database
+wget -q -c ftp://ftp.ncbi.nih.gov/pub/COG/COG2014/data/*2014* -P ./cog/cog2014
+gunzip ./cog/cog2014/prot2003-2014.fa.gz
+```
+

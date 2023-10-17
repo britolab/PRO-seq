@@ -1,0 +1,462 @@
+---
+title: "inverton analysis"
+output: html_notebook
+---
+
+## read in bin data
+```{r}
+# read the BINSTATS file made with the clean_assemble_bin.sh pipeline
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_bins <- read_tsv("US2_25May2022/DASTool/US2_25May2022_BINSTATS.txt", col_names = TRUE)
+US3_bins <- read_tsv("US3_25May2022/DASTool/US3_25May2022_BINSTATS.txt", col_names = TRUE)
+```
+
+## read in scaffold2bin mapping
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/assembly/")
+US2_scaff2bin <- read_tsv("US2_25May2022/DASTool/US2_25May2022_DASTool_scaffolds2bin.txt", col_names = c("contig", "bin"))
+US3_scaff2bin <- read_tsv("US3_25May2022/DASTool/US3_25May2022_DASTool_scaffolds2bin.txt", col_names = c("contig", "bin"))
+```
+
+## read in inverton data and subset for invertons in bins
+```{r}
+read_inverton <- function(inv_coords, inv_ratio, scaff2bin,
+                          bindat, clen, complete, contam) {
+  
+  require(tidyverse)
+  
+  # add one to numeric values to account for 0-indexed positions
+  # filter for invertons in bins and contigs with length >= clen
+  # select invertons where left and right IR are exactly the same
+  left_join(
+    read_tsv(file = inv_coords,
+             col_names = c("contig","left_start","left_stop",
+                           "right_start","right_stop",
+                           "left_IR","inverton","right_IR")),
+    read_tsv(file = inv_ratio,
+             col_names = TRUE) |>
+      separate(col = ID, into = c("contig","left_start","left_stop",
+                                         "right_start","right_stop"),
+                      sep = ":|-",
+                      convert = TRUE),
+    by = c("contig","left_start","left_stop","right_start","right_stop")
+    ) |>
+    mutate(length = as.double(str_match(string = contig,
+                                               pattern = "length_\\s*(.*?)\\s*_cov")[,2])) |>
+    mutate(across(c("left_start","left_stop","right_start","right_stop"),
+                  function(x) { x + 1 })) |>
+    left_join(scaff2bin, by = "contig") |>
+    left_join(bindat, by = "bin") |>
+    filter(!is.na(bin),
+           length >= clen,
+           completeness >= complete,
+           contamination <= contam) |>
+    mutate(L_revcomp = as.character(
+      Biostrings::reverseComplement(
+        Biostrings::DNAStringSet(left_IR)
+        ))) |>
+    filter(right_IR == L_revcomp)
+    #filter(Span_ratio != 0)
+    
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation")
+US2_inverton <- read_inverton("US2_phasefinder/US2.einverted.tab",
+                              "US2_phasefinder/US2_out.ratio.txt",
+                              US2_scaff2bin, US2_bins, 1000, 90, 5)
+US3_inverton <- read_inverton("US3_phasefinder/US3.einverted.tab",
+                              "US3_phasefinder/US3_out.ratio.txt",
+                              US3_scaff2bin, US3_bins, 1000, 90, 5)
+```
+
+## read in coverage data and subset for inverton contigs
+```{r}
+subset_cov <- function(file, idat) {
+  
+  # context is sequence to extract up and downstream of IRs
+  # mincov is minimum proseq coverage between IRs (inclusive)
+  
+  setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+  
+  clist <- idat |> select(contig) |> 
+    dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+                                                        pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+    purrr::as_vector()
+  
+  big <- readr::read_tsv(file = file,
+                  col_names = TRUE)
+  
+  # Normalization factors (per million mapped nt)
+  PROnorm <- (sum(dplyr::select(big, PRO_plus_full)) + sum(dplyr::select(big, PRO_minus_full))) / 10^9
+  RNAnorm <- (sum(dplyr::select(big, RNA_plus)) + sum(dplyr::select(big, RNA_minus))) / 10^9
+  TEXpnorm <- (sum(dplyr::select(big, TEXp_plus)) + sum(dplyr::select(big, TEXp_minus))) / 10^9
+  TEXmnorm <- (sum(dplyr::select(big, TEXm_plus)) + sum(dplyr::select(big, TEXm_minus))) / 10^9
+  
+  ### Approach 2 : FASTER
+  # subby <- idat |>
+  #   dplyr::select(contig, left_start, right_stop, group) |>
+  #   dplyr::mutate(contig = as.double(stringr::str_match(string = contig,
+  #                                                       pattern = "NODE_\\s*(.*?)\\s*_length")[,2])) |>
+  #   tidyr::pivot_longer(cols = c(start, end),
+  #                       values_to = "position") |>
+  #   dplyr::select(contig, position, group) |>
+  #   dplyr::group_by(contig, group) |>
+  #   tidyr::complete(position = seq(from = min(position),
+  #                                  to = max(position))) |>
+  #   dplyr::ungroup() |>
+  #   dplyr::left_join(big, by = c("contig", "position")) |> 
+  big |>
+    dplyr::mutate(PRO_plus_full = PRO_plus_full / PROnorm,
+                  PRO_minus_full = PRO_minus_full / PROnorm,
+                  PRO_plus_3 = PRO_plus_3 / PROnorm,
+                  PRO_minus_3 = PRO_minus_3 / PROnorm,
+                  PRO_plus_5 = PRO_plus_5 / PROnorm,
+                  PRO_minus_5 = PRO_minus_5 / PROnorm,
+                  RNA_plus = RNA_plus / RNAnorm,
+                  RNA_minus = RNA_minus / RNAnorm,
+                  TEXp_plus = TEXp_plus / TEXpnorm,
+                  TEXp_minus = TEXp_minus / TEXpnorm,
+                  TEXm_plus = TEXm_plus / TEXmnorm,
+                  TEXm_minus = TEXm_minus / TEXmnorm) |>
+    dplyr::filter(contig %in% clist) |>
+    tidyr::pivot_longer(cols = -c(contig,position),
+                        names_to = "lib",
+                        values_to = "value") |>
+    dplyr::mutate(value = ifelse(grepl(pattern = "plus", x = lib), # flipped!!!
+                                 yes = -1 * as.numeric(value),
+                                 no = as.numeric(value))) |>
+    dplyr::mutate(strand = ifelse(grepl(pattern = "minus", x = lib),
+                                  yes = "minus",
+                                  no = "plus")) |>
+    dplyr::mutate(type = dplyr::case_when(grepl(pattern = "3", x = lib) ~ "PROseq 5'", # flipped!!!
+                                          grepl(pattern = "5", x = lib) ~ "PROseq 3'", # flipped!!!
+                                          grepl(pattern = "full", x = lib) ~ "PROSeq full",
+                                          grepl(pattern = "RNA", x = lib) ~ "RNAseq",
+                                          grepl(pattern = "TEXm", x = lib) ~ "dRNAseq TEX-",
+                                          grepl(pattern = "TEXp", x = lib) ~ "dRNAseq TEX+"))
+    
+    # dplyr::group_by(group) |>
+    # dplyr::mutate(grpmax = max(PRO_plus_full, PRO_minus_full, na.rm = TRUE)) |>
+    #               #xrng = max(position, na.rm = TRUE) - min(position, na.rm = TRUE)) |>
+    # dplyr::filter(grpmax >= mincov) |> dplyr::ungroup()
+    #               #xrng >= context)
+  
+  ### https://stackoverflow.com/q/74437717/7976890
+  
+  # # subset for invertons with mincov between IRs
+  # subout <- tibble::tibble()
+  # apply(idat_grouped, 1, function(irow) {
+  #   message(paste("processing group",irow[[4]]))
+  #   ir1 <- as.integer(irow[[2]])
+  #   ir2 <- as.integer(irow[[3]])
+  #   sgrp <- dplyr::filter(subby,
+  #                         group == as.integer(irow[[4]]),
+  #                         position %in% c(ir1:ir2))
+  #   maxp <- max(abs(sgrp$PRO_plus_full), na.rm = TRUE)
+  #   maxm <- max(abs(sgrp$PRO_minus_full), na.rm = TRUE)
+  #   psum <- maxp + maxm
+  #   message(paste("--> sum =",psum))
+  #   if (psum >= mincov) {
+  #     subout <- dplyr::filter(subby,
+  #                   group == as.integer(irow[[4]])) |>
+  #       dplyr::bind_rows(subout)
+  #   }
+  # })
+  # 
+  # subout
+  
+}
+
+#setwd("/workdir/users/acv46/stool_PROSeq3/transcriptomes/pileup")
+#US2_cov <- subset_cov("US2_combined_q30_correct.txt", US2_inverton)
+#US3_cov <- subset_cov("US3_combined_q30_correct.txt", US3_inverton)
+```
+
+## subset invertons for nonzero coverage within invertible region
+```{r}
+subsub <- function(invdat, covdat, cutoff) {
+  
+  require(tidyverse)
+  
+  invdat |> select(contig, left_start, right_stop) |>
+    mutate(contig = as.double(stringr::str_match(string = contig,
+                                                 pattern = "NODE_\\s*(.*?)\\s*_length")[,2]
+                              )) |>
+    apply(MARGIN = 1, function(x) {
+      sub_ <- filter(covdat, contig == x[1], position %in% x[2]:x[3])
+      promax <- filter(sub_, lib %in% c("PRO_plus_full","PRO_minus_full")) |> select(value) |> abs() |> max(na.rm = TRUE)
+      rnamax <- filter(sub_, lib %in% c("RNA_plus","RNA_minus")) |> select(value) |> abs() |> max(na.rm = TRUE)
+      tibble(contig = x[1], left_start = x[2], right_stop = x[3], promax = promax, rnamax = rnamax)
+      }) |> bind_rows() |>
+    filter(promax > cutoff | rnamax > cutoff) |> select(contig, left_start, right_stop)
+  
+}
+
+US2_sublist <- subsub(US2_inverton, US2_cov, 10)
+US3_sublist <- subsub(US3_inverton, US3_cov, 10)
+```
+
+## read in bakta annotations and subset for prophage contigs
+```{r}
+read_gff3 <- function(gff3, idat) {
+  
+  require(tidyverse)
+  cnames <- c("contig","source","feature","start","end","score","strand","frame","attribute")
+  
+  readr::read_tsv(file = gff3, comment = "#", col_names = cnames) |>
+    dplyr::filter(contig %in% unique(idat$contig)) |> 
+    dplyr::filter(feature != "region") |>
+    dplyr::mutate(product = stringr::str_match(attribute, "Name=\\s*(.*?)\\s*;locus_tag")[,2]) |>
+    dplyr::select(contig, start, end, strand, product)
+    
+}
+
+setwd("/workdir/users/acv46/stool_PROSeq3/annotation/")
+US2_genes <- read_gff3("US2_allbins_bakta1.7.gff3", US2_inverton)
+US3_genes <- read_gff3("US3_allbins_bakta1.7.gff3", US3_inverton)
+```
+
+## plot coverage across invertons
+```{r}
+plot_inv <- function(lab, covdat, idat, genedat, context, writeout) {
+  
+  # context and mincov determined by input coverage data
+  
+  # lab = sample label used for output filename string
+  # covdat = coverage data, made in chunk above
+  # pdat = prophage data, made in chunk above
+  # bindat = bin data
+  # scaff2bin = scaffold-to-bin mapping file
+  # genedat = genes on prophage contigs
+  # qscore = qscore used to filter mapping values used to create coverage file
+  
+  require(tidyverse)
+  require(stringr)
+  require(patchwork)
+  require(staplr)
+  require(gggenes)
+  
+  basepal <- c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#ffff33')
+  basepal2 <- c("#e0607e","#aec5eb","#f4d35e","#ee964b","#3ab795")
+  
+  # iterate through contig list
+  apply(X = idat, MARGIN = 1, function(xi) {
+    
+    # get data of interest
+    con <- as.character(xi[1])
+    ibin <- as.character(xi[16])
+    phl <- as.character(xi[26])
+    spc <- as.character(xi[31])
+    L1 <- as.integer(xi[2])
+    L2 <- as.integer(xi[3])
+    R1 <- as.integer(xi[4])
+    R2 <- as.integer(xi[5])
+    Span_F <- as.integer(xi[12])
+    Span_R <- as.integer(xi[13])
+    # get shortened contig name as it appears in covdat
+    con_short <- stringr::str_match(string = con, 
+                                    pattern = "NODE_\\s*(.*?)\\s*_length")[2]
+    # get length of full contig
+    clen <- as.numeric(stringr::str_match(string = con,
+                                          pattern = "length_\\s*(.*?)\\s*_cov")[2])
+    if (is.na(spc)) {
+      spc <- "[no species]"
+    }
+    
+    # context should be the same as context for coverage data, in chunk above
+    xmin <- L1 - context
+    xmax <- R2 + context
+
+    if (xmin < 1) {
+      xmin <- 1
+    }
+    if (xmax > clen) {
+      xmax <- clen
+    }
+    
+    cov <- covdat |> dplyr::filter(contig == con_short) |>
+      dplyr::filter(position %in% xmin:xmax) 
+    
+    # make sure there's some PROseq signal
+    # prosum <- filter(cov,
+    #                  type == "PROSeq full",
+    #                  position %in% L1:R2) |>
+    #   select(value) |> abs() |> max()
+    
+    ymax <- max(abs(cov$value))
+    
+    message(paste("bin:",ibin,", contig:",con,", coords: ",L1,L2,R1,R2))
+    message(paste0("xmin:",xmin,", xmax:",xmax,", ymax:",ymax))
+           
+    tri1 <- data.frame(x = as.numeric(c(L1,L2,L1)),
+                       y = c(0.2 * ymax, 0, -0.2 * ymax),
+                       stringsAsFactors = F)
+           
+    tri2 <- data.frame(x = as.numeric(c(R2,R1,R2)),
+                       y = c(0.2 * ymax, 0, -0.2 * ymax),
+                       stringsAsFactors = F)
+          
+    breaks <- c(seq(from = round(xmin, digits = -1),
+                    to = round(xmax, digits = -1),
+                    by = round((xmax - xmin)/5, digits = -1)))
+    
+    numgenes <- genedat |>
+      filter(contig == con) |>
+      nrow()
+    if (numgenes > 1) {
+    # if (numgenes > 1 & prosum >= prosum_cutoff) {
+      genes <- dplyr::filter(genedat, contig == con) |>
+        dplyr::mutate(orientation = ifelse(strand == "+", 1, -1)) |>
+        dplyr::mutate(index = paste0("gene",1:n()))
+           
+      pal <- rep_len(basepal2, nrow(genes))
+           
+      pc <- ggplot() +
+        geom_area(data = cov,
+                  mapping = aes(x = position, y = value),
+                  color = "red") +
+        facet_grid(type ~ .) + 
+        geom_text(data = cov,
+                  mapping = aes(x = xmin + ((xmax - xmin) %/% 60),
+                                y = -ymax * 0.8,
+                                label = type),
+                  hjust = 0, size = 3,
+                  check_overlap = TRUE) +
+        coord_cartesian(xlim = c(xmin, xmax),
+                        ylim = c(-ymax - (0.02 * ymax), ymax + (0.02 * ymax)),
+                        clip = "on") +
+        theme_bw() +
+        geom_hline(yintercept = 0, color = "black") +
+        xlab("") +
+        ylab("Depth per 10^9 mapped nucleotides") +
+        theme(strip.background = element_blank(),
+              strip.text.y = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.text.x = element_blank(),
+              axis.ticks.x = element_blank(),
+              plot.title = element_text(size = 8),
+              plot.margin = unit(c(0,0,0,0), "cm")) +
+        geom_polygon(data = tri1,
+                     mapping = aes(x = x, y = y),
+                     fill = "blue",
+                     alpha = 0.4,
+                     inherit.aes = F) +
+        geom_polygon(data = tri2,
+                     mapping = aes(x = x, y = y),
+                     fill = "blue",
+                     alpha = 0.4,
+                     inherit.aes = F)
+      
+      geneplot <- ggplot(genes,
+                         aes(xmin = start,
+                             xmax = end,
+                             y = contig,
+                             fill = index,
+                             label = product,
+                             forward = orientation)) +
+        geom_gene_arrow(arrowhead_width = grid::unit(6, "mm"),
+                        arrowhead_height = grid::unit(6, "mm"),
+                        arrow_body_height = grid::unit(4, "mm")) +
+        geom_gene_label() +
+        facet_wrap(~ contig, scales = "free", ncol = 1) +
+        scale_fill_manual(values = pal) +
+        theme_genes() +
+        theme(legend.position = "none",
+              axis.text.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.title.x = element_blank()) +
+        ylab(" ") +
+        scale_x_continuous(breaks = breaks) +
+        coord_cartesian(xlim = c(xmin, xmax))
+             
+        # use patchwork, ggarrange messes up vertical alingments
+             
+      merged2 <- pc / geneplot +
+        plot_layout(ncol=1, nrow = 2,
+                    heights = c(4.5,1)) +
+        plot_annotation(
+          title = paste0(lab,", ",phl," (Span_F=",Span_F,", Span_R=",Span_R,")"),
+          subtitle = paste0(spc),
+          caption = paste0("bin: ",ibin,", contig: ",con)
+          ) &
+        theme(plot.title = element_text(size = 10),
+              plot.subtitle = element_text(size = 9, face = "italic"),
+              plot.caption = element_text(size = 7))
+    
+    
+      # save each plot as a pdf
+      fname <- paste(lab, con_short, L1,L2,R1,R2, "partial.pdf", sep = "_")
+      ggsave(filename = fname,
+             plot = merged2,
+             device = cairo_pdf,
+             dpi = 600,
+             width = 5,
+             height = 7)
+      } # if statement
+    }) # sapply statement
+  
+  # get list of pdf files
+  glob <- glob2rx(paste0(lab,"*_partial.pdf"))
+  pdflist <- list.files(path = ".", pattern = glob)
+  # split list into chunks of 100
+  pdflist_100 <- split(pdflist, ceiling(seq_along(pdflist)/100))
+  # combine pdfs into a single file
+  lapply(seq_along(pdflist_100), function(x) {
+    
+    index <- sprintf("%02d",x)
+    partout <- paste0(writeout,"_part",index,".pdf")
+    staplr::staple_pdf(input_files = pdflist_100[[x]],
+                       output_filepath = file.path(".", partout))
+    
+    if (file.exists(partout)) {
+      do.call(file.remove, list(pdflist_100[[x]]))
+    }
+    
+  })
+  
+}
+```
+
+### combine pdfs, standalone
+```{r}
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/invertons/v7")
+lab <- "US3"
+writeout <- "US3_inv_c500_q30_com90con5_SpanPR10_v7"
+
+# get list of pdf files
+glob <- glob2rx(paste0(lab,"*_partial.pdf"))
+pdflist <- list.files(path = ".", pattern = glob)
+# split list into chunks of 100
+pdflist_100 <- split(pdflist, ceiling(seq_along(pdflist)/100))
+# combine pdfs into a single file
+lapply(seq_along(pdflist_100), function(x) {
+  
+  index <- sprintf("%02d",x)
+  partout <- paste0(writeout,"_part",index,".pdf")
+  staplr::staple_pdf(input_files = pdflist_100[[x]],
+                     output_filepath = file.path(".", partout))
+    
+  if (file.exists(partout)) {
+    do.call(file.remove, list(pdflist_100[[x]]))
+  }
+    
+})
+```
+
+### test plotting function on subset of contigs
+```{r}
+# testing
+setwd("/workdir/users/acv46/stool_PROSeq3/figures/invertons")
+rm("US2_inv_test.pdf")
+plot_inv(lab = "US2",
+         covdat = US2_cov,
+         idat = dplyr::slice(US2_inverton, 1:2),
+         genedat = US2_genes,
+         context = 500,
+         writeout = "US2_inv_test.pdf")
+```
+
+
+
+
