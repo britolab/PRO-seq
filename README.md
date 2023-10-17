@@ -17,7 +17,7 @@ The main scripts for cleaning up transcript reads and mapping those reads to ref
 
 [`EC_peaks.rmd`](https://github.com/britolab/PRO-seq/blob/main/data_processing_and_figures/EC_peaks.rmd) and [`Stool_PRO-seq.Rmd`](https://github.com/britolab/PRO-seq/blob/main/data_processing_and_figures/Stool_PRO-seq.Rmd) contain the R code used for the *E. coli* and human microbiome analyses, respectively. The Rmarkdown documents are ordered by main sections (`#`) and subsections (`##`/`###`).
 
-Post-review, analyses were conducted in separate notebooks. These notebooks can be found in the [`data_processing_and_figures`](https://github.com/britolab/PRO-seq/blob/main/data_processing_and_figures).
+Post-review, analyses were conducted in separate notebooks. These notebooks can be found in [`data_processing_and_figures`](https://github.com/britolab/PRO-seq/blob/main/data_processing_and_figures).
 
 ### data availability
 
