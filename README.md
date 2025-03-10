@@ -1,3 +1,5 @@
+https://doi.org/10.1038/s41564-023-01558-w
+
 ## PRO-seq and RNAseq in *E. coli* and microbiomes
 Much of the code in this repo was not used in the final analyses. The most important scripts are listed below.
 
